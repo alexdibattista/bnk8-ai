@@ -1,0 +1,1204 @@
+//! The configurator window: device bar, layer list, keypad editor,
+//! macros, timing, and the pending-changes/apply bar.
+
+use std::fmt;
+use std::path::PathBuf;
+use std::sync::mpsc::{Sender, channel};
+
+use anyhow::Result;
+use iced::futures::channel::oneshot;
+use iced::widget::{
+    Column, button, center, column, container, mouse_area, opaque, pick_list, row, rule, scrollable, slider, space,
+    stack, text, text_input, tooltip,
+};
+use iced::{Alignment, Color, Element, Fill, Font, Length, Task, Theme};
+
+use bnk8::config::{self, Blob, Changes, Config, FACTORY, KEY_SLOTS, KNOB_SLOTS, Key, Layer, Slots};
+use bnk8::presets::{self, Preset};
+use bnk8::store::{self, Current, Source};
+use bnk8::{actions, transport};
+
+use crate::style::{self, BOLD, SEMIBOLD, Tone};
+use crate::widgets::{Catalog, action_picker, key_picker, macro_summary, short, tip};
+
+const SLOT_LABELS: [&str; 6] = ["Tap", "Double tap", "Hold", "Tap then hold", "Turn left", "Turn right"];
+const MAX_MACRO_STEPS: usize = 7;
+const KEY_SIZE: (f32, f32) = (136.0, 116.0);
+const KNOB_SIZE: f32 = 116.0;
+/// Bindings and lighting cards; wide enough for a label and both pickers.
+const EDITOR_WIDTH: f32 = 540.0;
+const LABEL_WIDTH: f32 = 140.0;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Control {
+    Key(usize),
+    Knob,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Tab {
+    Keys,
+    Macros,
+    Timing,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Device {
+    serial: String,
+    fw: String,
+}
+
+impl fmt::Display for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}  ·  fw {}", elide(&self.serial, 20), self.fw)
+    }
+}
+
+/// What the app knows about the connected device.
+struct Connected {
+    serial: String,
+    /// The device's config, when bnk8 can prove it (snapshot/factory CRC match).
+    config: Option<Box<Blob>>,
+    source: &'static str,
+}
+
+/// What reading the device found.
+#[derive(Clone, Debug)]
+pub enum Read {
+    Known(Box<Blob>, &'static str),
+    Unknown { crc: u32 },
+}
+
+/// Results of background device work. Every hidapi call runs on one
+/// long-lived worker thread: on macOS hidapi pumps the calling thread's
+/// run loop (aborting winit on the main thread) and schedules its global
+/// HID manager on the first caller's run loop (so that thread must live).
+#[derive(Clone, Debug)]
+pub enum Done {
+    Devices(Vec<Device>),
+    Loaded { serial: String, read: Read },
+    Written { blob: Box<Blob>, changes: usize },
+}
+
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Validation and diff of the edited config, recomputed when it changes.
+enum Preview {
+    Invalid(String),
+    Ready { blob: Box<Blob>, changes: Changes },
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Verb {
+    Tap,
+    Press,
+    Release,
+    Delay,
+}
+
+impl Verb {
+    const ALL: [Verb; 4] = [Verb::Tap, Verb::Press, Verb::Release, Verb::Delay];
+
+    fn parse(s: &str) -> Option<Verb> {
+        Some(match s {
+            "tap" => Verb::Tap,
+            "press" => Verb::Press,
+            "release" => Verb::Release,
+            "delay" => Verb::Delay,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Verb::Tap => "tap",
+            Verb::Press => "press",
+            Verb::Release => "release",
+            Verb::Delay => "delay",
+        }
+    }
+}
+
+impl fmt::Display for Verb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Verb::Tap => "Tap",
+            Verb::Press => "Press",
+            Verb::Release => "Release",
+            Verb::Delay => "Delay",
+        })
+    }
+}
+
+/// A macro step split into its verb (`None` for raw bytes) and argument.
+fn parse_step(step: &str) -> (Option<Verb>, &str) {
+    if step.starts_with("raw.") {
+        return (None, step);
+    }
+    let (verb, arg) = step.split_once(' ').unwrap_or((step, ""));
+    match Verb::parse(verb) {
+        Some(v) => (Some(v), arg),
+        None => (None, step),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum LightingEdit {
+    Effect(u8),
+    Brightness(u8),
+    Speed(u8),
+    Color(String),
+    Channel(usize, u8),
+    Flags(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum StepEdit {
+    Verb(Verb),
+    Key(String),
+    Delay(u16),
+    Raw(String),
+    Up,
+    Down,
+    Remove,
+}
+
+#[derive(Clone, Debug)]
+pub enum Message {
+    Finished(Result<Done, String>),
+    RefreshDevices,
+    SelectDevice(Device),
+    Load,
+    DismissBanner,
+    SelectTab(Tab),
+    SelectLayer(usize),
+    AddLayer,
+    AddPreset(&'static Preset),
+    RemoveLayer,
+    SelectControl(Control),
+    SetSlot(&'static str, Option<String>),
+    Lighting(LightingEdit),
+    SelectMacro(usize),
+    Step(usize, StepEdit),
+    AddKeyStep,
+    AddDelay,
+    ClearSteps,
+    DoubleTap(u16),
+    Hold(u16),
+    ToggleChanges,
+    Apply,
+    Discard,
+    Import,
+    Imported(Option<PathBuf>),
+    Export,
+    Exported(Option<PathBuf>),
+    AskReset,
+    ConfirmReset,
+    CancelReset,
+}
+
+pub struct App {
+    devices: Vec<Device>,
+    serial: Option<String>,
+    connected: Option<Connected>,
+    cfg: Config,
+    layer: usize,
+    control: Control,
+    tab: Tab,
+    macro_slot: usize,
+    preview: Preview,
+    preview_of: Option<Config>,
+    /// Label of the running device job, if any.
+    busy: Option<&'static str>,
+    worker: Sender<Job>,
+    message: Option<(Tone, String)>,
+    show_changes: bool,
+    confirm_reset: bool,
+    catalog: Catalog,
+    /// Layer templates, as pick-list options.
+    templates: Vec<&'static Preset>,
+}
+
+impl App {
+    pub fn new() -> (Self, Task<Message>) {
+        let (worker, jobs) = channel::<Job>();
+        std::thread::Builder::new()
+            .name("hid".into())
+            .spawn(move || {
+                for job in jobs {
+                    job();
+                }
+            })
+            .expect("spawning the HID thread");
+        let mut app = App {
+            devices: Vec::new(),
+            serial: None,
+            connected: None,
+            cfg: config::from_blob(FACTORY).expect("factory config decodes"),
+            layer: 0,
+            control: Control::Key(0),
+            tab: Tab::Keys,
+            macro_slot: 0,
+            preview: Preview::Invalid(String::new()),
+            preview_of: None,
+            busy: None,
+            worker,
+            message: None,
+            show_changes: false,
+            confirm_reset: false,
+            catalog: Catalog::new(),
+            templates: presets::PRESETS.iter().collect(),
+        };
+        let task = app.refresh_devices();
+        app.refresh_preview();
+        (app, task)
+    }
+
+    fn info(&mut self, text: impl Into<String>) {
+        self.message = Some((Tone::Success, text.into()));
+    }
+
+    fn error(&mut self, text: impl Into<String>) {
+        self.message = Some((Tone::Danger, text.into()));
+    }
+
+    fn spawn(&mut self, label: &'static str, f: impl FnOnce() -> Result<Done> + Send + 'static) -> Task<Message> {
+        let (tx, rx) = oneshot::channel();
+        let job: Job = Box::new(move || {
+            let _ = tx.send(f().map_err(|e| format!("{e:#}")));
+        });
+        if self.worker.send(job).is_err() {
+            self.error("The HID worker thread stopped; restart the app.");
+            return Task::none();
+        }
+        self.busy = Some(label);
+        Task::perform(rx, |r| {
+            Message::Finished(r.unwrap_or_else(|_| Err("The HID worker thread stopped; restart the app.".into())))
+        })
+    }
+
+    fn refresh_devices(&mut self) -> Task<Message> {
+        self.spawn("Looking for devices", || {
+            let api = hidapi::HidApi::new()?;
+            Ok(Done::Devices(
+                transport::find(&api)
+                    .iter()
+                    .filter_map(|d| {
+                        Some(Device {
+                            serial: d.serial_number()?.to_string(),
+                            fw: transport::format_fw(d.release_number()),
+                        })
+                    })
+                    .collect(),
+            ))
+        })
+    }
+
+    fn load(&mut self) -> Task<Message> {
+        let serial = self.serial.clone();
+        self.spawn("Reading device", move || {
+            let dev = transport::open(serial.as_deref())?;
+            let read = match store::current(&dev)? {
+                Current::Known(blob, Source::Factory) => Read::Known(blob, "factory default"),
+                Current::Known(blob, Source::Snapshot) => Read::Known(blob, "last written by bnk8"),
+                Current::Unknown { crc } => Read::Unknown { crc },
+            };
+            Ok(Done::Loaded { serial: dev.serial().to_string(), read })
+        })
+    }
+
+    fn write(&mut self, blob: Box<Blob>, changes: usize) -> Task<Message> {
+        let Some(serial) = self.connected.as_ref().map(|c| c.serial.clone()) else { return Task::none() };
+        self.spawn("Writing to device", move || {
+            let dev = transport::open(Some(&serial))?;
+            store::write(&dev, &blob)?;
+            Ok(Done::Written { blob, changes })
+        })
+    }
+
+    fn finished(&mut self, result: Result<Done, String>) -> Task<Message> {
+        self.busy = None;
+        // The diff base may have changed even if the edited config did not.
+        self.preview_of = None;
+        match result {
+            Err(e) => self.error(e),
+            Ok(Done::Devices(devices)) => {
+                self.devices = devices;
+                if self.serial.as_ref().is_none_or(|s| !self.devices.iter().any(|d| &d.serial == s)) {
+                    self.serial = self.devices.first().map(|d| d.serial.clone());
+                }
+                if self.devices.is_empty() {
+                    self.error("No BNK8 AI Edition found. Plug it in and press Refresh.");
+                } else if self.connected.is_none() {
+                    return self.load();
+                }
+            }
+            Ok(Done::Loaded { serial, read }) => {
+                let (blob, source) = match read {
+                    Read::Known(blob, source) => {
+                        self.info(format!("Loaded {serial} ({source})"));
+                        (Some(blob), source)
+                    }
+                    Read::Unknown { crc } => {
+                        self.error(format!(
+                            "This device's config (CRC {crc:#010x}) was written by another tool and cannot be read back. \
+                             Editing starts from the factory defaults; Apply writes the whole config."
+                        ));
+                        (None, "unknown")
+                    }
+                };
+                self.cfg = config::from_blob(blob.as_deref().unwrap_or(FACTORY)).expect("verified blob decodes");
+                self.layer = self.layer.min(self.cfg.layers.len() - 1);
+                self.connected = Some(Connected { serial, config: blob, source });
+            }
+            Ok(Done::Written { blob, changes }) => {
+                self.cfg = config::from_blob(&blob).expect("written blob decodes");
+                if let Some(c) = &mut self.connected {
+                    c.config = Some(blob);
+                    c.source = "last written by bnk8";
+                }
+                self.info(format!("Saved {changes} change(s) to the device"));
+            }
+        }
+        Task::none()
+    }
+
+    fn base(&self) -> &Blob {
+        self.connected.as_ref().and_then(|c| c.config.as_deref()).unwrap_or(FACTORY)
+    }
+
+    fn refresh_preview(&mut self) {
+        if self.preview_of.as_ref() == Some(&self.cfg) {
+            return;
+        }
+        let before = self.connected.as_ref().and_then(|c| c.config.as_deref());
+        self.preview = match config::to_blob(&self.cfg, self.base()).and_then(|b| {
+            let changes = config::changes(before, &b)?;
+            Ok((b, changes))
+        }) {
+            Ok((blob, changes)) => Preview::Ready { blob: Box::new(blob), changes },
+            Err(e) => Preview::Invalid(format!("{e:#}")),
+        };
+        self.preview_of = Some(self.cfg.clone());
+    }
+
+    /// Number of changes Apply would write, when it can write.
+    fn pending(&self) -> Option<(&Blob, usize)> {
+        let Preview::Ready { blob, changes } = &self.preview else { return None };
+        let count = match changes {
+            Changes::Unknown => config::flatten(&self.cfg).len(),
+            Changes::Items(lines) => lines.len(),
+        };
+        Some((blob, count))
+    }
+
+    fn clamp_layer(&mut self) {
+        self.layer = self.layer.min(self.cfg.layers.len() - 1);
+    }
+
+    // ---- update -------------------------------------------------------
+
+    pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.apply_message(message);
+        self.refresh_preview();
+        task
+    }
+
+    fn apply_message(&mut self, message: Message) -> Task<Message> {
+        let idle = self.busy.is_none();
+        match message {
+            Message::Finished(result) => return self.finished(result),
+            Message::RefreshDevices if idle => return self.refresh_devices(),
+            Message::SelectDevice(d) => self.serial = Some(d.serial),
+            Message::Load if idle && self.serial.is_some() => return self.load(),
+            Message::DismissBanner => self.message = None,
+            Message::SelectTab(tab) => self.tab = tab,
+            Message::SelectLayer(i) => {
+                self.layer = i;
+                self.tab = Tab::Keys;
+            }
+            Message::AddLayer if self.cfg.layers.len() < actions::MAX_LAYERS => {
+                let knob = Slots { hold: Some("layer.next".into()), ..Slots::default() };
+                let lighting = self.cfg.layers[self.layer].lighting.clone();
+                self.cfg.layers.push(Layer { keys: vec![Key::Tap("none".into()); 8], knob, lighting });
+                self.layer = self.cfg.layers.len() - 1;
+            }
+            Message::AddPreset(preset) => {
+                let lighting = self.cfg.layers[self.layer].lighting.clone();
+                match presets::add(&mut self.cfg, preset, &lighting) {
+                    Ok(i) => {
+                        self.layer = i;
+                        self.tab = Tab::Keys;
+                        self.control = Control::Key(0);
+                        let legend: Vec<String> =
+                            preset.legend.iter().enumerate().map(|(k, l)| format!("K{} {l}", k + 1)).collect();
+                        self.info(format!("Added {} as layer {i}: {}. Knob: volume, press mutes the mic.", preset.name, legend.join(" · ")));
+                    }
+                    Err(e) => self.error(format!("{e:#}")),
+                }
+            }
+            Message::RemoveLayer if self.cfg.layers.len() > 1 => {
+                self.cfg.layers.remove(self.layer);
+                self.clamp_layer();
+            }
+            Message::SelectControl(c) => self.control = c,
+            Message::SetSlot(name, value) => {
+                let layer = &mut self.cfg.layers[self.layer];
+                match self.control {
+                    Control::Key(k) => {
+                        let mut slots = layer.keys[k].slots();
+                        let slot = slots.slot_mut(name).expect("key slot name");
+                        if *slot != value {
+                            *slot = value;
+                            layer.keys[k] = Key::from_slots(slots);
+                        }
+                    }
+                    Control::Knob => *layer.knob.slot_mut(name).expect("knob slot name") = value,
+                }
+            }
+            Message::Lighting(edit) => {
+                let l = &mut self.cfg.layers[self.layer].lighting;
+                match edit {
+                    LightingEdit::Effect(v) => l.effect = v,
+                    LightingEdit::Brightness(v) => l.brightness = v,
+                    LightingEdit::Speed(v) => l.speed = v,
+                    LightingEdit::Color(c) => l.color = c,
+                    LightingEdit::Channel(i, v) => {
+                        let mut rgb = parse_rgb(&l.color).unwrap_or([255, 255, 255]);
+                        rgb[i] = v;
+                        l.color = hex_rgb(rgb);
+                    }
+                    LightingEdit::Flags(s) if s.is_empty() => l.flags = 0,
+                    LightingEdit::Flags(s) => {
+                        if let Ok(v) = s.parse() {
+                            l.flags = v;
+                        }
+                    }
+                }
+            }
+            Message::SelectMacro(m) => self.macro_slot = m,
+            Message::Step(i, edit) => self.edit_macro(|steps| match edit {
+                StepEdit::Verb(v) => {
+                    let (old, arg) = parse_step(&steps[i]);
+                    if old == Some(v) {
+                        return;
+                    }
+                    steps[i] = match (v, old) {
+                        (Verb::Delay, _) => "delay 100".into(),
+                        (v, Some(Verb::Tap | Verb::Press | Verb::Release)) => format!("{} {arg}", v.name()),
+                        (v, _) => format!("{} keyboard.a", v.name()),
+                    };
+                }
+                StepEdit::Key(k) => {
+                    if let (Some(v), _) = parse_step(&steps[i]) {
+                        steps[i] = format!("{} {k}", v.name());
+                    }
+                }
+                StepEdit::Delay(ms) => steps[i] = format!("delay {}", ms / 10 * 10),
+                StepEdit::Raw(s) => steps[i] = s,
+                StepEdit::Up if i > 0 => steps.swap(i - 1, i),
+                StepEdit::Down if i + 1 < steps.len() => steps.swap(i, i + 1),
+                StepEdit::Remove => {
+                    steps.remove(i);
+                }
+                StepEdit::Up | StepEdit::Down => {}
+            }),
+            Message::AddKeyStep => self.edit_macro(|steps| {
+                if key_steps(steps) < MAX_MACRO_STEPS {
+                    steps.push("tap keyboard.a".into());
+                }
+            }),
+            Message::AddDelay => self.edit_macro(|steps| steps.push("delay 100".into())),
+            Message::ClearSteps => self.edit_macro(Vec::clear),
+            Message::DoubleTap(ms) => self.cfg.timing.double_tap_ms = ms,
+            Message::Hold(ms) => self.cfg.timing.hold_ms = ms,
+            Message::ToggleChanges => self.show_changes = !self.show_changes,
+            Message::Apply if idle && self.connected.is_some() => {
+                if let Some((blob, n)) = self.pending().filter(|(_, n)| *n > 0) {
+                    let blob = Box::new(*blob);
+                    return self.write(blob, n);
+                }
+            }
+            Message::Discard if idle => {
+                self.cfg = config::from_blob(self.base()).expect("base decodes");
+                self.clamp_layer();
+            }
+            Message::Import => {
+                return Task::perform(
+                    rfd::AsyncFileDialog::new().add_filter("TOML", &["toml"]).pick_file(),
+                    |f| Message::Imported(f.map(|f| f.path().to_path_buf())),
+                );
+            }
+            Message::Imported(Some(path)) => self.import(path),
+            Message::Export => {
+                return Task::perform(
+                    rfd::AsyncFileDialog::new().add_filter("TOML", &["toml"]).set_file_name("bnk8.toml").save_file(),
+                    |f| Message::Exported(f.map(|f| f.path().to_path_buf())),
+                );
+            }
+            Message::Exported(Some(path)) => self.export(path),
+            Message::AskReset if idle && self.connected.is_some() => self.confirm_reset = true,
+            Message::ConfirmReset => {
+                self.confirm_reset = false;
+                return self.write(Box::new(*FACTORY), 1);
+            }
+            Message::CancelReset => self.confirm_reset = false,
+            // Stale clicks on controls that are disabled now, and cancelled dialogs.
+            Message::RefreshDevices
+            | Message::Load
+            | Message::AddLayer
+            | Message::RemoveLayer
+            | Message::Apply
+            | Message::Discard
+            | Message::AskReset
+            | Message::Imported(None)
+            | Message::Exported(None) => {}
+        }
+        Task::none()
+    }
+
+    /// Edits the selected macro's steps; an emptied macro is removed.
+    fn edit_macro(&mut self, f: impl FnOnce(&mut Vec<String>)) {
+        let key = self.macro_slot.to_string();
+        let mut steps = self.cfg.macros.remove(&key).unwrap_or_default();
+        f(&mut steps);
+        if !steps.is_empty() {
+            self.cfg.macros.insert(key, steps);
+        }
+    }
+
+    fn import(&mut self, path: PathBuf) {
+        let result = std::fs::read_to_string(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|t| config::from_toml(&t))
+            .and_then(|c| config::to_blob(&c, FACTORY).map(|_| c));
+        match result {
+            Ok(c) => {
+                self.cfg = c;
+                self.clamp_layer();
+                self.info(format!("Imported {} (not yet applied)", path.display()));
+            }
+            Err(e) => self.error(format!("{}: {e:#}", path.display())),
+        }
+    }
+
+    fn export(&mut self, path: PathBuf) {
+        match config::to_toml(&self.cfg).and_then(|t| Ok(std::fs::write(&path, t)?)) {
+            Ok(()) => self.info(format!("Exported {}", path.display())),
+            Err(e) => self.error(format!("{}: {e:#}", path.display())),
+        }
+    }
+
+    // ---- view ---------------------------------------------------------
+
+    pub fn view(&self) -> Element<'_, Message> {
+        let body = row![
+            container(self.sidebar()).width(220).height(Fill).style(style::chrome),
+            rule::vertical(1).style(rule::weak),
+            scrollable(container(self.content()).padding(28).width(Fill)).height(Fill).width(Fill),
+        ];
+        let page = column![
+            container(self.header()).width(Fill).style(style::chrome),
+            rule::horizontal(1).style(rule::weak),
+        ]
+        .push(self.banner())
+        .push(body.height(Fill))
+        .push(rule::horizontal(1).style(rule::weak))
+        .push(container(self.footer()).width(Fill).style(style::chrome));
+        if self.confirm_reset { stack![page, self.reset_dialog()].into() } else { page.into() }
+    }
+
+    fn header(&self) -> Element<'_, Message> {
+        let idle = self.busy.is_none();
+        let brand = row![
+            container(text("B8").size(14).font(BOLD)).padding([6, 8]).style(style::pill(Tone::Accent)),
+            column![
+                text("BNK8 AI Edition").size(17).font(BOLD),
+                text("Configurator").size(12).style(style::muted)
+            ],
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+        let status: Element<'_, Message> = match (&self.busy, &self.connected) {
+            (Some(label), _) => status_pill(Tone::Accent, format!("{label}…")),
+            (None, Some(c)) if c.config.is_some() => status_pill(Tone::Success, format!("Config: {}", c.source)),
+            (None, Some(c)) => status_pill(Tone::Danger, format!("Config: {}", c.source)),
+            (None, None) => status_pill(Tone::Neutral, "Not connected".into()),
+        };
+        let selected = self.devices.iter().find(|d| Some(&d.serial) == self.serial.as_ref());
+        row![
+            brand,
+            space::horizontal(),
+            status,
+            pick_list(&self.devices[..], selected, Message::SelectDevice)
+                .placeholder("No device found")
+                .width(310)
+                .text_size(13)
+                .style(style::field),
+            button("Refresh").style(style::ghost).on_press_maybe(idle.then_some(Message::RefreshDevices)),
+            button("Load from device")
+                .style(style::ghost)
+                .on_press_maybe((idle && self.serial.is_some()).then_some(Message::Load)),
+        ]
+        .spacing(10)
+        .padding([12, 20])
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    fn banner(&self) -> Option<Element<'_, Message>> {
+        let (tone, msg) = self.message.as_ref()?;
+        let content = row![
+            container(space()).width(8).height(8).style(style::dot(*tone)),
+            text(msg).size(13).width(Fill),
+            button(text("✕").size(12)).style(style::icon).padding([2, 8]).on_press(Message::DismissBanner),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+        Some(container(container(content).padding([8, 12]).style(style::banner(*tone))).padding([10, 20]).into())
+    }
+
+    fn sidebar(&self) -> Element<'_, Message> {
+        let nav = [(Tab::Keys, "Keys & lighting"), (Tab::Macros, "Macros"), (Tab::Timing, "Timing")]
+            .into_iter()
+            .map(|(tab, label)| nav_button(text(label).size(14), self.tab == tab, Message::SelectTab(tab)));
+        let layers = self.cfg.layers.iter().enumerate().map(|(i, layer)| {
+            let content = row![
+                container(space()).width(12).height(12).style(style::swatch(layer_color(layer))),
+                text(format!("Layer {i}")).size(14),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center);
+            nav_button(content, self.layer == i, Message::SelectLayer(i))
+        });
+        let n = self.cfg.layers.len();
+        column![
+            section_label("VIEW"),
+            Column::with_children(nav).spacing(2),
+            space().height(18),
+            section_label("LAYERS"),
+            text("Hold the knob to switch layers (factory binding).").size(11).style(style::muted),
+            space().height(4),
+            Column::with_children(layers).spacing(2),
+            space().height(6),
+            row![
+                button(text("+ Add").size(13))
+                    .style(style::ghost)
+                    .on_press_maybe((n < actions::MAX_LAYERS).then_some(Message::AddLayer)),
+                tooltip(
+                    button(text("Remove").size(13))
+                        .style(style::ghost_danger)
+                        .on_press_maybe((n > 1).then_some(Message::RemoveLayer)),
+                    tip("Remove the selected layer"),
+                    tooltip::Position::Bottom,
+                ),
+            ]
+            .spacing(8),
+            tooltip(
+                pick_list(&self.templates[..], None::<&Preset>, Message::AddPreset)
+                    .placeholder("+ Add from template…")
+                    .width(Fill)
+                    .text_size(13)
+                    .style(style::field),
+                tip("Adds a new layer of meeting shortcuts. Shortcuts with modifiers use free macro slots."),
+                tooltip::Position::Bottom,
+            ),
+        ]
+        .spacing(6)
+        .padding(16)
+        .into()
+    }
+
+    fn content(&self) -> Element<'_, Message> {
+        match self.tab {
+            Tab::Keys => self.keys_tab(),
+            Tab::Macros => self.macros_tab(),
+            Tab::Timing => self.timing_tab(),
+        }
+    }
+
+    fn keys_tab(&self) -> Element<'_, Message> {
+        let l = self.layer;
+        column![
+            page_title(format!("Layer {l}"), "Pick a key or the knob, then choose what each gesture does."),
+            // Wraps the editors below the keypad when the window is too narrow for both.
+            row![
+                column![
+                    self.keypad(),
+                    text("Layout as seen from above; the knob is top right.").size(11).style(style::muted),
+                    text("+N: extra gestures bound. L/R: knob turns.").size(11).style(style::muted),
+                ]
+                .spacing(8),
+                column![self.slot_editor(), self.lighting_editor()].spacing(18).width(EDITOR_WIDTH),
+            ]
+            .spacing(28)
+            .wrap()
+            .vertical_spacing(22),
+        ]
+        .spacing(22)
+        .into()
+    }
+
+    fn keypad(&self) -> Element<'_, Message> {
+        let layer = &self.cfg.layers[self.layer];
+        let rows: [[Control; 3]; 3] = [
+            [Control::Key(0), Control::Key(1), Control::Knob],
+            [Control::Key(2), Control::Key(3), Control::Key(4)],
+            [Control::Key(5), Control::Key(6), Control::Key(7)],
+        ];
+        let grid = Column::with_children(rows.map(|r| {
+            row(r.map(|c| self.keycap(layer, c))).spacing(12).into()
+        }))
+        .spacing(12);
+        let glow = (layer.lighting.effect != 0).then(|| layer_color(layer));
+        container(grid).padding(20).style(style::device(glow)).into()
+    }
+
+    fn keycap(&self, layer: &Layer, c: Control) -> Element<'_, Message> {
+        let selected = self.control == c;
+        let (title, slots) = match c {
+            Control::Key(k) => (format!("K{}", k + 1), layer.keys[k].slots()),
+            Control::Knob => ("Knob".to_string(), layer.knob.clone()),
+        };
+        // A key's face shows its tap binding, or its hold binding when tap is empty.
+        let (face, on_hold) = match (&slots.tap, &slots.hold) {
+            (None, Some(hold)) if c != Control::Knob => (Some(hold.as_str()), true),
+            (tap, _) => (tap.as_deref(), false),
+        };
+        let bound = face.is_some();
+        let gestures = KEY_SLOTS.iter().filter(|s| slots.get(s).is_some()).count();
+        let extra = gestures - usize::from(bound);
+        // Macros read as the shortcut they play, e.g. Cmd+Shift+A.
+        let shortcut = face
+            .and_then(|f| f.strip_prefix("macro."))
+            .and_then(|n| self.cfg.macros.get(n))
+            .map(|steps| macro_summary(steps))
+            .filter(|s| !s.is_empty());
+        let label = shortcut.clone().unwrap_or_else(|| short(face));
+        let note = match (shortcut.is_some().then(|| short(face)), on_hold) {
+            (Some(name), true) => Some(format!("{name} · hold")),
+            (Some(name), false) => Some(name),
+            (None, true) => Some("hold".to_string()),
+            (None, false) => None,
+        };
+        let main = |max: usize, size: f32| {
+            text(elide(&label, max))
+                .size(size)
+                .font(SEMIBOLD)
+                .style(move |t: &Theme| if bound { text::base(t) } else { style::muted(t) })
+        };
+        let badge = (extra > 0).then(|| text(format!("+{extra}")).size(11).style(style::accent));
+        match c {
+            Control::Key(_) => {
+                let content = column![
+                    row![text(title).size(12).style(style::muted), space::horizontal()].push(badge),
+                    space::vertical(),
+                    main(14, 17.0),
+                ]
+                .push(note.map(|n| text(n).size(11).style(style::muted)));
+                button(content)
+                    .width(KEY_SIZE.0)
+                    .height(KEY_SIZE.1)
+                    .padding(12)
+                    .style(style::keycap(selected, 10.0))
+                    .on_press(Message::SelectControl(c))
+                    .into()
+            }
+            Control::Knob => {
+                let turns = (slots.ccw.is_some() || slots.cw.is_some()).then(|| {
+                    let turn = |dir: &str, slot: &Option<String>| {
+                        text(format!("{dir}: {}", elide(&short(slot.as_deref()), 9))).size(11).style(style::muted)
+                    };
+                    column![turn("L", &slots.ccw), turn("R", &slots.cw)].align_x(Alignment::Center)
+                });
+                let content = column![row![text(title).size(11).style(style::muted)].push(badge).spacing(4), main(12, 14.0)]
+                    .push(turns)
+                    .spacing(2)
+                    .align_x(Alignment::Center);
+                let knob = button(center(content))
+                    .width(KNOB_SIZE)
+                    .height(KNOB_SIZE)
+                    .padding(6)
+                    .style(style::keycap(selected, KNOB_SIZE / 2.0))
+                    .on_press(Message::SelectControl(c));
+                container(knob).center_x(KEY_SIZE.0).center_y(KEY_SIZE.1).into()
+            }
+        }
+    }
+
+    fn slot_editor(&self) -> Element<'_, Message> {
+        let layer = &self.cfg.layers[self.layer];
+        let (title, names, labels): (String, &[&'static str], &[&str]) = match self.control {
+            Control::Key(k) => (format!("K{}", k + 1), &KEY_SLOTS, &SLOT_LABELS[..4]),
+            Control::Knob => ("Knob".into(), &KNOB_SLOTS, &SLOT_LABELS),
+        };
+        let knob = self.control == Control::Knob;
+        let rows = names.iter().zip(labels).map(|(&name, &label)| {
+            let label = if knob && name == "tap" { "Press" } else { label };
+            let value = match self.control {
+                Control::Key(k) => key_slot(&layer.keys[k], name),
+                Control::Knob => layer.knob.get(name).map(String::as_str),
+            };
+            field_row(label, action_picker(&self.catalog, value, move |v| Message::SetSlot(name, v)))
+        });
+        card(
+            format!("{title} bindings"),
+            column![Column::with_children(rows).spacing(10)]
+                .push(hint("Tap fires instantly when the other gestures are empty; otherwise after the double-tap window."))
+                .spacing(12),
+        )
+    }
+
+    fn lighting_editor(&self) -> Element<'_, Message> {
+        let l = &self.cfg.layers[self.layer].lighting;
+        let rgb = parse_rgb(&l.color);
+        let [r, g, b] = rgb.unwrap_or([255, 255, 255]);
+        let effect = tooltip(
+            slider(0..=config::MAX_EFFECT, l.effect, |v| Message::Lighting(LightingEdit::Effect(v))),
+            tip("0 = off. The action 'RGB effect next' cycles 1 3 4 5 12 13 14 15 16 21 24 26 28 34 35 36 38 42 43 44."),
+            tooltip::Position::Top,
+        );
+        let channel = |i: usize, name: &'static str, v: u8| {
+            row![
+                text(name).size(12).width(14).style(style::muted),
+                slider(0..=255, v, move |v| Message::Lighting(LightingEdit::Channel(i, v))),
+                text(v).size(12).width(28).align_x(Alignment::End).style(style::muted),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+        };
+        let colour = row![
+            container(space())
+                .width(32)
+                .height(32)
+                .style(style::swatch(rgb.map_or(Color::TRANSPARENT, |[r, g, b]| Color::from_rgb8(r, g, b)))),
+            text_input("#RRGGBB", &l.color)
+                .on_input(|s| Message::Lighting(LightingEdit::Color(s)))
+                .font(Font::MONOSPACE)
+                .width(110)
+                .style(style::input),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+        let channels = row![
+            space().width(LABEL_WIDTH),
+            column![channel(0, "R", r), channel(1, "G", g), channel(2, "B", b)].spacing(6),
+        ]
+        .spacing(12);
+        let flags = tooltip(
+            text_input("0", &l.flags.to_string())
+                .on_input(|s| Message::Lighting(LightingEdit::Flags(s)))
+                .font(Font::MONOSPACE)
+                .width(70)
+                .style(style::input),
+            tip("Raw flags byte; factory value 1."),
+            tooltip::Position::Top,
+        );
+        let body = column![
+            value_row("Effect", effect, if l.effect == 0 { "off".into() } else { l.effect.to_string() }),
+            value_row(
+                "Brightness",
+                slider(0..=config::MAX_BRIGHTNESS, l.brightness, |v| Message::Lighting(LightingEdit::Brightness(v))),
+                l.brightness.to_string()
+            ),
+            value_row("Speed", slider(0..=255, l.speed, |v| Message::Lighting(LightingEdit::Speed(v))), l.speed.to_string()),
+            field_row("Colour", colour),
+            channels,
+            field_row("Flags", flags),
+        ]
+        .push(l.extra.is_some().then(|| hint("This layer has undecoded per-LED data; it is kept as is.")))
+        .spacing(12);
+        card("Lighting".into(), body)
+    }
+
+    fn macros_tab(&self) -> Element<'_, Message> {
+        let list = (0..actions::MACRO_SLOTS).map(|m| {
+            let n = self.cfg.macros.get(&m.to_string()).map_or(0, |s| key_steps(s));
+            let count = match n {
+                0 => "empty".to_string(),
+                1 => "1 step".to_string(),
+                n => format!("{n} steps"),
+            };
+            let content = row![
+                text(format!("Macro {m}")).size(14).width(Fill),
+                text(count).size(12).style(if n == 0 { style::section } else { style::muted }),
+            ]
+            .align_y(Alignment::Center);
+            nav_button(content, self.macro_slot == m, Message::SelectMacro(m))
+        });
+        column![
+            page_title(
+                "Macros".into(),
+                "Up to 15 macros of 7 key steps each. Bind one by picking Macro and its number in any key or knob slot."
+            ),
+            row![
+                container(Column::with_children(list).spacing(2)).padding(8).width(230).style(style::card),
+                self.macro_editor(),
+            ]
+            .spacing(20),
+        ]
+        .spacing(22)
+        .into()
+    }
+
+    fn macro_editor(&self) -> Element<'_, Message> {
+        let m = self.macro_slot;
+        let steps: &[String] = self.cfg.macros.get(&m.to_string()).map_or(&[], Vec::as_slice);
+        let n = steps.len();
+        let rows = steps.iter().enumerate().map(|(i, step)| {
+            let (verb, arg) = parse_step(step);
+            let verb_pick = pick_list(Verb::ALL, verb, move |v| Message::Step(i, StepEdit::Verb(v)))
+                .placeholder("Raw")
+                .width(110)
+                .style(style::field);
+            let editor: Element<'_, Message> = match verb {
+                Some(Verb::Delay) => {
+                    let ms: u16 = arg.parse().unwrap_or(0);
+                    row![
+                        slider(0..=2550, ms, move |v| Message::Step(i, StepEdit::Delay(v))).step(10u16).width(Fill),
+                        text(format!("{ms} ms")).size(12).width(64).align_x(Alignment::End).style(style::muted),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center)
+                    .width(Length::Fixed(200.0))
+                    .into()
+                }
+                Some(_) => key_picker(&self.catalog, arg, move |k| Message::Step(i, StepEdit::Key(k))),
+                None => text_input("raw.…", step)
+                    .on_input(move |s| Message::Step(i, StepEdit::Raw(s)))
+                    .font(Font::MONOSPACE)
+                    .width(200)
+                    .style(style::input)
+                    .into(),
+            };
+            let icon = |label: &'static str, enabled: bool, edit: StepEdit| {
+                button(text(label).size(13))
+                    .style(style::icon)
+                    .padding([4, 8])
+                    .on_press_maybe(enabled.then_some(Message::Step(i, edit)))
+            };
+            row![
+                text(format!("{}", i + 1)).size(12).width(22).style(style::muted),
+                verb_pick,
+                editor,
+                space::horizontal(),
+                icon("↑", i > 0, StepEdit::Up),
+                icon("↓", i + 1 < n, StepEdit::Down),
+                icon("✕", true, StepEdit::Remove),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into()
+        });
+        let list: Element<'_, Message> = if n == 0 {
+            text("No steps yet.").size(13).style(style::muted).into()
+        } else {
+            Column::with_children(rows).spacing(8).into()
+        };
+        let actions = row![
+            button(text("+ Key step").size(13))
+                .style(style::ghost)
+                .on_press_maybe((key_steps(steps) < MAX_MACRO_STEPS).then_some(Message::AddKeyStep)),
+            button(text("+ Delay").size(13)).style(style::ghost).on_press(Message::AddDelay),
+            space::horizontal(),
+            button(text("Clear").size(13)).style(style::ghost_danger).on_press_maybe((n > 0).then_some(Message::ClearSteps)),
+        ]
+        .spacing(8);
+        card(
+            format!("Macro {m}"),
+            column![list, actions, hint("A delay (multiple of 10 ms, up to 2550 ms) waits before the next key step.")]
+                .spacing(14),
+        )
+    }
+
+    fn timing_tab(&self) -> Element<'_, Message> {
+        let t = &self.cfg.timing;
+        column![
+            page_title("Timing".into(), "Applies to every key and the knob press."),
+            card(
+                "Gestures".into(),
+                column![
+                    value_row(
+                        "Double-tap window",
+                        slider(100..=800, t.double_tap_ms, Message::DoubleTap),
+                        format!("{} ms", t.double_tap_ms)
+                    ),
+                    value_row("Hold threshold", slider(150..=2000, t.hold_ms, Message::Hold), format!("{} ms", t.hold_ms)),
+                ]
+                .spacing(14),
+            ),
+        ]
+        .spacing(22)
+        .max_width(640)
+        .into()
+    }
+
+    fn footer(&self) -> Element<'_, Message> {
+        let idle = self.busy.is_none();
+        let connected = self.connected.is_some();
+        let lines = match &self.preview {
+            Preview::Ready { changes: Changes::Items(lines), .. } => lines.as_slice(),
+            _ => &[],
+        };
+        let (tone, summary) = match &self.preview {
+            Preview::Invalid(e) => (Tone::Danger, format!("Invalid: {e}")),
+            Preview::Ready { changes: Changes::Unknown, .. } => {
+                (Tone::Accent, "Device config unknown: Apply writes everything".into())
+            }
+            Preview::Ready { .. } if lines.is_empty() => (Tone::Neutral, "No changes".into()),
+            Preview::Ready { .. } => (Tone::Accent, format!("{} pending change(s)", lines.len())),
+        };
+        let summary = if connected { summary } else { format!("{summary} (not connected)") };
+        let can_apply = idle && connected && self.pending().is_some_and(|(_, n)| n > 0);
+        let toggle = (!lines.is_empty()).then(|| {
+            button(text(if self.show_changes { "Hide changes" } else { "Show changes" }).size(12))
+                .style(style::icon)
+                .padding([4, 8])
+                .on_press(Message::ToggleChanges)
+        });
+        let bar = row![
+            container(space()).width(8).height(8).style(style::dot(tone)),
+            text(summary).size(13).font(SEMIBOLD),
+        ]
+        .push(toggle)
+        .push(space::horizontal())
+        .push(button(text("Import TOML…").size(13)).style(style::ghost).on_press(Message::Import))
+        .push(button(text("Export TOML…").size(13)).style(style::ghost).on_press(Message::Export))
+        .push(
+            button(text("Factory reset…").size(13))
+                .style(style::ghost_danger)
+                .on_press_maybe((idle && connected).then_some(Message::AskReset)),
+        )
+        .push(rule::vertical(1).style(rule::weak))
+        .push(button(text("Discard edits").size(13)).style(style::ghost).on_press_maybe(idle.then_some(Message::Discard)))
+        .push(
+            button(text("Apply to device").size(13).font(BOLD))
+                .style(style::primary)
+                .padding([6, 16])
+                .on_press_maybe(can_apply.then_some(Message::Apply)),
+        )
+        .spacing(10)
+        .height(34)
+        .align_y(Alignment::Center);
+        let changes = (self.show_changes && !lines.is_empty()).then(|| {
+            container(scrollable(
+                Column::with_children(lines.iter().map(|l| text(l).size(12).font(Font::MONOSPACE).into())).spacing(2),
+            ))
+            .max_height(140)
+            .width(Fill)
+            .padding(10)
+            .style(style::card)
+        });
+        column![].push(changes).push(bar).spacing(10).padding([10, 20]).into()
+    }
+
+    fn reset_dialog(&self) -> Element<'_, Message> {
+        let dialog = container(
+            column![
+                text("Restore factory config?").size(20).font(BOLD),
+                text("Replaces every layer, binding, macro and lighting setting on the device.").size(14),
+                row![
+                    space::horizontal(),
+                    button("Cancel").style(style::ghost).on_press(Message::CancelReset),
+                    button("Restore factory config").style(style::danger).on_press(Message::ConfirmReset),
+                ]
+                .spacing(10),
+            ]
+            .spacing(16),
+        )
+        .width(440)
+        .padding(24)
+        .style(style::dialog);
+        opaque(mouse_area(center(opaque(dialog)).style(style::backdrop)).on_press(Message::CancelReset))
+    }
+}
+
+// ---- view helpers ------------------------------------------------------
+
+/// A key's binding in `slot`, borrowed; the `none` placeholder reads as unbound (as in `Key::slots`).
+fn key_slot<'a>(key: &'a Key, slot: &str) -> Option<&'a str> {
+    match key {
+        Key::Tap(a) if slot == "tap" && a != "none" => Some(a),
+        Key::Tap(_) => None,
+        Key::Slots(s) => s.get(slot).map(String::as_str),
+    }
+}
+
+fn page_title<'a>(title: String, subtitle: &'a str) -> Element<'a, Message> {
+    column![text(title).size(26).font(BOLD), text(subtitle).size(13).style(style::muted)].spacing(4).into()
+}
+
+fn section_label(label: &str) -> Element<'_, Message> {
+    text(label).size(11).font(BOLD).style(style::section).into()
+}
+
+fn hint(body: &str) -> Element<'_, Message> {
+    text(body).size(12).style(style::muted).into()
+}
+
+fn card<'a>(title: String, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(column![text(title).size(15).font(BOLD), body.into()].spacing(14))
+        .padding(18)
+        .width(Fill)
+        .style(style::card)
+        .into()
+}
+
+fn field_row<'a>(label: &'a str, field: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    row![text(label).size(13).width(LABEL_WIDTH), field.into()].spacing(12).align_y(Alignment::Center).into()
+}
+
+fn value_row<'a>(label: &'a str, field: impl Into<Element<'a, Message>>, value: String) -> Element<'a, Message> {
+    row![
+        text(label).size(13).width(LABEL_WIDTH),
+        container(field).width(Fill),
+        text(value).size(12).font(Font::MONOSPACE).width(56).align_x(Alignment::End).style(style::muted),
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn nav_button<'a>(content: impl Into<Element<'a, Message>>, selected: bool, on_press: Message) -> Element<'a, Message> {
+    button(content).width(Fill).padding([7, 10]).style(style::nav(selected)).on_press(on_press).into()
+}
+
+fn status_pill<'a>(tone: Tone, label: String) -> Element<'a, Message> {
+    container(
+        row![container(space()).width(7).height(7).style(style::dot(tone)), text(label).size(12)]
+            .spacing(7)
+            .align_y(Alignment::Center),
+    )
+    .padding([5, 12])
+    .style(style::pill(tone))
+    .into()
+}
+
+/// Shortens `s` to at most `max` characters, ending in an ellipsis.
+fn elide(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max - 1).collect();
+    out.push('…');
+    out
+}
+
+fn key_steps(steps: &[String]) -> usize {
+    steps.iter().filter(|s| !s.starts_with("delay")).count()
+}
+
+fn parse_rgb(s: &str) -> Option<[u8; 3]> {
+    let h = s.strip_prefix('#').filter(|h| h.len() == 6)?;
+    let v = |i: usize| u8::from_str_radix(h.get(i..i + 2)?, 16).ok();
+    Some([v(0)?, v(2)?, v(4)?])
+}
+
+fn hex_rgb([r, g, b]: [u8; 3]) -> String {
+    format!("#{r:02X}{g:02X}{b:02X}")
+}
+
+fn layer_color(layer: &Layer) -> Color {
+    let [r, g, b] = parse_rgb(&layer.lighting.color).unwrap_or([0, 0, 0]);
+    if layer.lighting.effect == 0 { Color::from_rgb8(40, 42, 50) } else { Color::from_rgb8(r, g, b) }
+}
