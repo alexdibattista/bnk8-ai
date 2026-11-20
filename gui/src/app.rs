@@ -77,7 +77,8 @@ pub enum Read {
 pub enum Done {
     Devices(Vec<Device>),
     Loaded { serial: String, read: Read },
-    Written { blob: Box<Blob>, changes: usize },
+    /// `edits` is the editor's config when the write started.
+    Written { blob: Box<Blob>, changes: usize, edits: Config },
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -308,11 +309,12 @@ impl App {
     }
 
     fn write(&mut self, blob: Box<Blob>, changes: usize) -> Task<Message> {
-        let Some(serial) = self.connected.as_ref().map(|c| c.serial.clone()) else { return Task::none() };
+        let Some(serial) = self.target().map(|c| c.serial.clone()) else { return Task::none() };
+        let edits = self.cfg.clone();
         self.spawn("Writing to device", move || {
             let dev = transport::open(Some(&serial))?;
             store::write(&dev, &blob)?;
-            Ok(Done::Written { blob, changes })
+            Ok(Done::Written { blob, changes, edits })
         })
     }
 
@@ -351,8 +353,14 @@ impl App {
                 self.layer = self.layer.min(self.cfg.layers.len() - 1);
                 self.connected = Some(Connected { serial, config: blob, source });
             }
-            Ok(Done::Written { blob, changes }) => {
-                self.cfg = config::from_blob(&blob).expect("written blob decodes");
+            Ok(Done::Written { blob, changes, edits }) => {
+                // The written blob is the new diff base. Edits made while it was
+                // being written stay pending against it; otherwise the editor
+                // shows what the device now holds (the factory config after a reset).
+                if self.cfg == edits {
+                    self.cfg = config::from_blob(&blob).expect("written blob decodes");
+                    self.clamp_layer();
+                }
                 if let Some(c) = &mut self.connected {
                     c.config = Some(blob);
                     c.source = "last written by bnk8";
@@ -365,6 +373,12 @@ impl App {
 
     fn base(&self) -> &Blob {
         self.connected.as_ref().and_then(|c| c.config.as_deref()).unwrap_or(FACTORY)
+    }
+
+    /// The connected device, when it is also the one selected in the device
+    /// picker: Apply and Factory reset write only to a device whose config is loaded.
+    fn target(&self) -> Option<&Connected> {
+        self.connected.as_ref().filter(|c| self.serial.as_deref() == Some(c.serial.as_str()))
     }
 
     fn refresh_preview(&mut self) {
@@ -438,8 +452,13 @@ impl App {
                 }
             }
             Message::RemoveLayer if self.cfg.layers.len() > 1 => {
-                self.cfg.layers.remove(self.layer);
+                let removed = self.layer;
+                self.cfg.layers.remove(removed);
+                let cleared = renumber_layer_refs(&mut self.cfg, removed);
                 self.clamp_layer();
+                if cleared > 0 {
+                    self.info(format!("Removed layer {removed}; cleared {cleared} binding(s) that switched to it."));
+                }
             }
             Message::SelectControl(c) => self.control = c,
             Message::SetSlot(name, value) => {
@@ -477,31 +496,37 @@ impl App {
                 }
             }
             Message::SelectMacro(m) => self.macro_slot = m,
-            Message::Step(i, edit) => self.edit_macro(|steps| match edit {
-                StepEdit::Verb(v) => {
-                    let (old, arg) = parse_step(&steps[i]);
-                    if old == Some(v) {
-                        return;
+            Message::Step(i, edit) => self.edit_macro(|steps| {
+                // A stale message for a step that no longer exists.
+                if i >= steps.len() {
+                    return;
+                }
+                match edit {
+                    StepEdit::Verb(v) => {
+                        let (old, arg) = parse_step(&steps[i]);
+                        if old == Some(v) {
+                            return;
+                        }
+                        steps[i] = match (v, old) {
+                            (Verb::Delay, _) => "delay 100".into(),
+                            (v, Some(Verb::Tap | Verb::Press | Verb::Release)) => format!("{} {arg}", v.name()),
+                            (v, _) => format!("{} keyboard.a", v.name()),
+                        };
                     }
-                    steps[i] = match (v, old) {
-                        (Verb::Delay, _) => "delay 100".into(),
-                        (v, Some(Verb::Tap | Verb::Press | Verb::Release)) => format!("{} {arg}", v.name()),
-                        (v, _) => format!("{} keyboard.a", v.name()),
-                    };
-                }
-                StepEdit::Key(k) => {
-                    if let (Some(v), _) = parse_step(&steps[i]) {
-                        steps[i] = format!("{} {k}", v.name());
+                    StepEdit::Key(k) => {
+                        if let (Some(v), _) = parse_step(&steps[i]) {
+                            steps[i] = format!("{} {k}", v.name());
+                        }
                     }
+                    StepEdit::Delay(ms) => steps[i] = format!("delay {}", ms / 10 * 10),
+                    StepEdit::Raw(s) => steps[i] = s,
+                    StepEdit::Up if i > 0 => steps.swap(i - 1, i),
+                    StepEdit::Down if i + 1 < steps.len() => steps.swap(i, i + 1),
+                    StepEdit::Remove => {
+                        steps.remove(i);
+                    }
+                    StepEdit::Up | StepEdit::Down => {}
                 }
-                StepEdit::Delay(ms) => steps[i] = format!("delay {}", ms / 10 * 10),
-                StepEdit::Raw(s) => steps[i] = s,
-                StepEdit::Up if i > 0 => steps.swap(i - 1, i),
-                StepEdit::Down if i + 1 < steps.len() => steps.swap(i, i + 1),
-                StepEdit::Remove => {
-                    steps.remove(i);
-                }
-                StepEdit::Up | StepEdit::Down => {}
             }),
             Message::AddKeyStep => self.edit_macro(|steps| {
                 if key_steps(steps) < MAX_MACRO_STEPS {
@@ -513,7 +538,7 @@ impl App {
             Message::DoubleTap(ms) => self.cfg.timing.double_tap_ms = ms,
             Message::Hold(ms) => self.cfg.timing.hold_ms = ms,
             Message::ToggleChanges => self.show_changes = !self.show_changes,
-            Message::Apply if idle && self.connected.is_some() => {
+            Message::Apply if idle && self.target().is_some() => {
                 if let Some((blob, n)) = self.pending().filter(|(_, n)| *n > 0) {
                     let blob = Box::new(*blob);
                     return self.write(blob, n);
@@ -537,10 +562,12 @@ impl App {
                 );
             }
             Message::Exported(Some(path)) => self.export(path),
-            Message::AskReset if idle && self.connected.is_some() => self.confirm_reset = true,
+            Message::AskReset if idle && self.target().is_some() => self.confirm_reset = true,
             Message::ConfirmReset => {
                 self.confirm_reset = false;
-                return self.write(Box::new(*FACTORY), 1);
+                if idle && self.target().is_some() {
+                    return self.write(Box::new(*FACTORY), 1);
+                }
             }
             Message::CancelReset => self.confirm_reset = false,
             // Stale clicks on controls that are disabled now, and cancelled dialogs.
@@ -1036,6 +1063,7 @@ impl App {
     fn footer(&self) -> Element<'_, Message> {
         let idle = self.busy.is_none();
         let connected = self.connected.is_some();
+        let target = self.target().is_some();
         let lines = match &self.preview {
             Preview::Ready { changes: Changes::Items(lines), .. } => lines.as_slice(),
             _ => &[],
@@ -1048,8 +1076,12 @@ impl App {
             Preview::Ready { .. } if lines.is_empty() => (Tone::Neutral, "No changes".into()),
             Preview::Ready { .. } => (Tone::Accent, format!("{} pending change(s)", lines.len())),
         };
-        let summary = if connected { summary } else { format!("{summary} (not connected)") };
-        let can_apply = idle && connected && self.pending().is_some_and(|(_, n)| n > 0);
+        let (tone, summary) = match (connected, target) {
+            (false, _) => (tone, format!("{summary} (not connected)")),
+            (true, false) => (Tone::Danger, "Selected device not loaded: press Load from device".into()),
+            (true, true) => (tone, summary),
+        };
+        let can_apply = idle && target && self.pending().is_some_and(|(_, n)| n > 0);
         let toggle = (!lines.is_empty()).then(|| {
             button(text(if self.show_changes { "Hide changes" } else { "Show changes" }).size(12))
                 .style(style::icon)
@@ -1067,7 +1099,7 @@ impl App {
         .push(
             button(text("Factory reset…").size(13))
                 .style(style::ghost_danger)
-                .on_press_maybe((idle && connected).then_some(Message::AskReset)),
+                .on_press_maybe((idle && target).then_some(Message::AskReset)),
         )
         .push(rule::vertical(1).style(rule::weak))
         .push(button(text("Discard edits").size(13)).style(style::ghost).on_press_maybe(idle.then_some(Message::Discard)))
@@ -1188,6 +1220,52 @@ fn key_steps(steps: &[String]) -> usize {
     steps.iter().filter(|s| !s.starts_with("delay")).count()
 }
 
+/// The layer a canonical `layer.N` action switches to.
+fn layer_index(action: &str) -> Option<usize> {
+    let n = action.strip_prefix("layer.")?;
+    n.parse().ok().filter(|i: &usize| i.to_string() == n)
+}
+
+/// Points `layer.N` bindings at the right layer after layer `removed` was
+/// deleted: later layers shift down by one, bindings to the removed layer are
+/// unbound. Returns how many bindings were unbound.
+fn renumber_layer_refs(cfg: &mut Config, removed: usize) -> usize {
+    let mut cleared = 0;
+    for layer in &mut cfg.layers {
+        for key in &mut layer.keys {
+            let mut slots = key.slots();
+            let (changed, n) = renumber_slots(&mut slots, &KEY_SLOTS, removed);
+            if changed {
+                *key = Key::from_slots(slots);
+            }
+            cleared += n;
+        }
+        cleared += renumber_slots(&mut layer.knob, &KNOB_SLOTS, removed).1;
+    }
+    cleared
+}
+
+/// `renumber_layer_refs` for one key or knob: whether any slot changed, and
+/// how many were unbound.
+fn renumber_slots(slots: &mut Slots, names: &[&str], removed: usize) -> (bool, usize) {
+    let (mut changed, mut cleared) = (false, 0);
+    for name in names {
+        let slot = slots.slot_mut(name).expect("slot name");
+        let Some(n) = slot.as_deref().and_then(layer_index) else { continue };
+        if n < removed {
+            continue;
+        }
+        if n == removed {
+            *slot = None;
+            cleared += 1;
+        } else {
+            *slot = Some(format!("layer.{}", n - 1));
+        }
+        changed = true;
+    }
+    (changed, cleared)
+}
+
 fn parse_rgb(s: &str) -> Option<[u8; 3]> {
     let h = s.strip_prefix('#').filter(|h| h.len() == 6)?;
     let v = |i: usize| u8::from_str_radix(h.get(i..i + 2)?, 16).ok();
@@ -1201,4 +1279,48 @@ fn hex_rgb([r, g, b]: [u8; 3]) -> String {
 fn layer_color(layer: &Layer) -> Color {
     let [r, g, b] = parse_rgb(&layer.lighting.color).unwrap_or([0, 0, 0]);
     if layer.lighting.effect == 0 { Color::from_rgb8(40, 42, 50) } else { Color::from_rgb8(r, g, b) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removing_a_layer_renumbers_layer_bindings() {
+        let mut base = config::from_blob(FACTORY).unwrap().layers.remove(0);
+        base.keys = vec![Key::Tap("none".into()); 8];
+        base.knob = Slots::default();
+        let mut cfg = config::from_blob(FACTORY).unwrap();
+        cfg.layers = vec![base.clone(), base.clone(), base];
+        let keys = &mut cfg.layers[0].keys;
+        keys[0] = Key::Tap("layer.2".into());
+        keys[1] = Key::Slots(Slots { tap: Some("layer.1".into()), hold: Some("layer.2".into()), ..Slots::default() });
+        keys[2] = Key::Tap("layer.0".into());
+        keys[3] = Key::Tap("keyboard.a".into());
+        keys[4] = Key::Tap("layer.next".into());
+        keys[5] = Key::Tap("layer.1".into());
+        keys[6] = Key::Tap("layer.02".into());
+        cfg.layers[2].knob = Slots {
+            hold: Some("layer.next".into()),
+            ccw: Some("layer.1".into()),
+            cw: Some("layer.2".into()),
+            ..Slots::default()
+        };
+
+        cfg.layers.remove(1);
+        assert_eq!(renumber_layer_refs(&mut cfg, 1), 3);
+
+        let keys = &cfg.layers[0].keys;
+        assert_eq!(keys[0], Key::Tap("layer.1".into()));
+        assert_eq!(keys[1], Key::Slots(Slots { hold: Some("layer.1".into()), ..Slots::default() }));
+        assert_eq!(keys[2], Key::Tap("layer.0".into()));
+        assert_eq!(keys[3], Key::Tap("keyboard.a".into()));
+        assert_eq!(keys[4], Key::Tap("layer.next".into()));
+        assert_eq!(keys[5], Key::Tap("none".into()));
+        assert_eq!(keys[6], Key::Tap("layer.02".into()));
+        assert_eq!(
+            cfg.layers[1].knob,
+            Slots { hold: Some("layer.next".into()), cw: Some("layer.1".into()), ..Slots::default() }
+        );
+    }
 }
