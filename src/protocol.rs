@@ -350,7 +350,16 @@ impl Bnk8 {
         }
         let crc = crc32(blob);
         let status = self.status()?;
-        let session = self.transfer_begin_persist(status.token_a, crc)?;
+        // The stream manager is idle here, so NAK 3 means another transfer session is
+        // still open, e.g. from a write that was interrupted. Its id cannot be recovered
+        // to abort it; a power cycle clears the session RAM.
+        let session = self.transfer_begin_persist(status.token_a, crc).map_err(|e| match e.downcast_ref::<Nak>() {
+            Some(Nak(3)) => e.context(
+                "the device refused to start a write, likely because an earlier write was \
+                 interrupted; unplug the BNK8, plug it back in, and try again",
+            ),
+            _ => e,
+        })?;
         let upload = (|| {
             for (i, chunk) in blob.chunks(CHUNK_DATA_MAX).enumerate() {
                 self.transfer_chunk(session, (i * CHUNK_DATA_MAX) as u16, chunk)?;

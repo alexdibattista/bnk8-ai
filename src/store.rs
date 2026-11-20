@@ -5,7 +5,7 @@
 //! (or the factory blob) whose CRC equals token B is therefore exactly what
 //! the device holds.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -38,8 +38,9 @@ fn path(serial: &str) -> Result<PathBuf> {
 
 pub fn current(dev: &Bnk8) -> Result<Current> {
     let crc = dev.status()?.token_b;
-    let p = path(dev.serial())?;
-    if let Ok(bytes) = std::fs::read(&p)
+    // Without a state directory there is no snapshot, but the factory check still applies.
+    if let Ok(p) = path(dev.serial())
+        && let Ok(bytes) = std::fs::read(&p)
         && let Ok(blob) = Blob::try_from(bytes.as_slice())
         && crc32(&blob) == crc
     {
@@ -51,17 +52,21 @@ pub fn current(dev: &Bnk8) -> Result<Current> {
     Ok(Current::Unknown { crc })
 }
 
-fn save(serial: &str, blob: &Blob) -> Result<()> {
-    let p = path(serial)?;
-    let d = p.parent().unwrap();
-    std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
+fn save(p: &Path, blob: &Blob) -> Result<()> {
     let tmp = p.with_extension("tmp");
     std::fs::write(&tmp, blob).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &p).with_context(|| format!("replacing {}", p.display()))
+    std::fs::rename(&tmp, p).with_context(|| format!("replacing {}", p.display()))
 }
 
-/// Persists `blob` to the device and records it as the snapshot.
+/// Persists `blob` to the device and records it as the snapshot. The snapshot
+/// directory is prepared first, so an unusable one fails before the device is touched.
 pub fn write(dev: &Bnk8, blob: &Blob) -> Result<()> {
+    let p = path(dev.serial())?;
+    let d = p.parent().unwrap();
+    std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
     dev.write_config(blob)?;
-    save(dev.serial(), blob)
+    save(&p, blob).context(
+        "the device was updated, but its local snapshot was not saved: \
+         bnk8 will report the config as unknown until the next apply or reset",
+    )
 }

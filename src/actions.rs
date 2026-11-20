@@ -126,7 +126,8 @@ fn name_param(name: &str) -> Option<u16> {
     if let Some((p, _)) = FIXED.iter().find(|(_, n)| *n == name) {
         return Some(*p);
     }
-    let index = |rest: &str, max: usize| rest.parse::<u16>().ok().filter(|n| (*n as usize) < max);
+    // Canonical numbers only: `macro.03` or `layer.+1` would alias another slot.
+    let index = |rest: &str, max: usize| rest.parse::<u16>().ok().filter(|n| n.to_string() == rest && (*n as usize) < max);
     if let Some(rest) = name.strip_prefix("layer.") {
         return index(rest, MAX_LAYERS).map(|n| 0x2100 | n);
     }

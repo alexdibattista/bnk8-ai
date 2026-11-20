@@ -180,7 +180,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -307,7 +307,7 @@ fn encode_steps(steps: &[String]) -> Result<Vec<[u8; 4]>> {
         let mode = match verb {
             "delay" => {
                 let ms: u32 = arg.parse().with_context(|| format!("{}: bad delay", ctx()))?;
-                ensure!(ms % 10 == 0, "{}: delay must be a multiple of 10 ms", ctx());
+                ensure!(ms.is_multiple_of(10), "{}: delay must be a multiple of 10 ms", ctx());
                 delay += ms / 10;
                 ensure!(delay <= 255, "{}: delay before one step exceeds 2550 ms", ctx());
                 continue;
@@ -429,8 +429,10 @@ pub fn to_blob(cfg: &Config, base: &Blob) -> Result<Blob> {
         let m: usize = slot
             .parse()
             .ok()
-            .filter(|m| *m < MACRO_SLOTS)
+            .filter(|m: &usize| *m < MACRO_SLOTS && m.to_string() == *slot)
             .with_context(|| format!("macros.{slot}: slot must be 0..={}", MACRO_SLOTS - 1))?;
+        // The device stores an empty macro as an unused slot, so it would not read back.
+        ensure!(!steps.is_empty(), "macros.{slot}: a macro needs at least one step");
         let enc = encode_steps(steps).with_context(|| format!("macros.{slot}"))?;
         let out = &mut b[OFF_MACROS + m * MACRO_LEN..][..MACRO_LEN];
         out[0] = enc.len() as u8;
@@ -452,6 +454,9 @@ fn resolve(name: Option<&String>, cfg: &Config) -> Result<Option<Action>> {
     let a = actions::encode(name)?;
     if let Some(m) = name.strip_prefix("macro.") {
         ensure!(cfg.macros.contains_key(m), "`{name}` has no [macros] entry \"{m}\"");
+    }
+    if let Some(n) = name.strip_prefix("layer.").and_then(|n| n.parse::<usize>().ok()) {
+        ensure!(n < cfg.layers.len(), "`{name}`: there are only {} layers", cfg.layers.len());
     }
     Ok(Some(a))
 }
@@ -601,5 +606,29 @@ mod tests {
         cfg.layers[1].keys.pop();
         let e = to_blob(&cfg, FACTORY).unwrap_err().to_string();
         assert!(e.starts_with("layers[1].keys: 7 keys"), "{e}");
+    }
+
+    /// Configs the device would store but not read back the same way.
+    #[test]
+    fn rejects_configs_that_would_not_round_trip() {
+        let base = from_blob(FACTORY).unwrap();
+        let err = |cfg: &Config| format!("{:#}", to_blob(cfg, FACTORY).unwrap_err());
+
+        let mut cfg = base.clone();
+        cfg.macros.insert("3".into(), vec![]);
+        assert!(err(&cfg).contains("macros.3: a macro needs at least one step"), "{}", err(&cfg));
+
+        let mut cfg = base.clone();
+        cfg.macros.insert("03".into(), vec!["tap keyboard.a".into()]);
+        assert!(err(&cfg).contains("macros.03: slot must be"), "{}", err(&cfg));
+
+        let mut cfg = base.clone();
+        cfg.macros.insert("3".into(), vec!["tap keyboard.a".into()]);
+        cfg.layers[0].keys[0] = Key::Tap("macro.03".into());
+        assert!(err(&cfg).contains("unknown action `macro.03`"), "{}", err(&cfg));
+
+        let mut cfg = base.clone();
+        cfg.layers[0].keys[0] = Key::Tap(format!("layer.{}", cfg.layers.len()));
+        assert!(err(&cfg).contains("there are only 4 layers"), "{}", err(&cfg));
     }
 }
