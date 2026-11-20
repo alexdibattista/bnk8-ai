@@ -14,6 +14,15 @@ It programs key bindings, knob gestures, macros, lighting and timing directly ov
 | `bnk8-gui` | `gui/` | Desktop configurator: keypad editor, macros, timing, lighting, layer templates |
 | Protocol notes | [`PROTOCOL.md`](PROTOCOL.md) | Reverse-engineered frame format, commands and 2000-byte config layout |
 
+## Download (macOS)
+
+Get the latest build from [Releases](https://github.com/alexdibattista/bnk8-ai/releases). Both downloads are signed and notarized by Apple and run on Apple Silicon and Intel Macs with macOS 11 or newer.
+
+- **App:** open `BNK8-Configurator-<version>-macos-universal.dmg` and drag **BNK8 Configurator** to Applications.
+- **CLI:** extract `bnk8-<version>-macos-universal.tar.gz` and move `bnk8` somewhere on your `PATH`, e.g. `/usr/local/bin`.
+
+Maintainers: see [RELEASING.md](RELEASING.md).
+
 ## Build
 
 Requires Rust 1.92 or newer (the GUI's file-dialog dependency, `rfd`, sets that minimum).
