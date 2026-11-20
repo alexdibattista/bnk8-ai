@@ -8,6 +8,8 @@ A release is a version tag (`v0.2.0`). Pushing the tag runs [`.github/workflows/
 | `bnk8-<version>-macos-universal.tar.gz` | `bnk8` CLI (signed and notarized), README and licenses |
 | `SHA256SUMS.txt` | Checksums of both |
 
+Unsigned pre-releases (see [below](#unsigned-pre-releases)) carry the same files with `-unsigned` before the extension, e.g. `BNK8-Configurator-<version>-macos-universal-unsigned.dmg`.
+
 The app requires macOS 11 or newer.
 
 ## One-time setup
@@ -63,7 +65,7 @@ Then delete the exported `.p12`, and keep the `.p8` somewhere safe, such as a pa
    git tag v0.2.0
    git push origin main v0.2.0
    ```
-4. Watch **Actions → Release (macOS)** (about 15 minutes; notarization is usually the slowest step). It fails early if the tag and the `Cargo.toml` versions differ.
+4. Watch **Actions → Release (macOS)** (about 15 minutes; notarization is usually the slowest step). It fails early if a GitHub secret is missing or the tag and the `Cargo.toml` versions differ, and it refuses to create a release if one for the tag already exists.
 5. Test the draft on a Mac. Download the DMG with a browser, so it gets the quarantine flag users get. Open it, drag the app to Applications and launch it: there must be no "unidentified developer" warning. Run `bnk8 --version` from the tarball.
 6. Edit the generated release notes and press **Publish**.
 
@@ -87,15 +89,29 @@ SIGN_IDENTITY="Developer ID Application: Alexander Di Battista (TEAMID)" \
 NOTARY_PROFILE=bnk8-notary \
 scripts/release-macos.sh 0.2.0
 
-gh release create v0.2.0 dist/* --draft --generate-notes --title "bnk8 v0.2.0"
+git push origin main
+gh release create v0.2.0 dist/* --draft --generate-notes --title "bnk8 v0.2.0" \
+  --target "$(git rev-parse HEAD)"
 ```
 
-`gh release create` creates the tag from the current `main` if you haven't pushed it.
+Push the commit first: `--target` points the tag at that commit, so GitHub must already have it. If several keychain identities share the name, pass the SHA-1 hash shown by `security find-identity -v -p codesigning` as `SIGN_IDENTITY` instead.
 
-## Smoke test without certificates
+Pushing the `v0.2.0` tag, or publishing the draft (which creates the tag), also starts the release workflow. It refuses with "a release for v0.2.0 already exists"; that failure is expected and changes nothing.
+
+## Unsigned pre-releases
+
+Without a Developer ID certificate you can still build and publish, but only as a GitHub **pre-release** whose title says "unsigned pre-release":
 
 ```sh
-SIGN_IDENTITY=- scripts/release-macos.sh 0.1.0
+SIGN_IDENTITY=- scripts/release-macos.sh 0.2.0
+
+git push origin main
+gh release create v0.2.0 dist/* --prerelease --generate-notes \
+  --title "bnk8 v0.2.0 (unsigned pre-release)" --target "$(git rev-parse HEAD)"
 ```
 
-This builds the same files with an ad-hoc signature and no notarization, so you can check the bundle and DMG. **Never publish these files**: Gatekeeper blocks them on other Macs. Add `TARGETS=aarch64-apple-darwin` to build only for Apple Silicon with Homebrew's Rust.
+`SIGN_IDENTITY=-` signs ad-hoc and skips notarization, and the files are named `…-macos-universal-unsigned.dmg` and `…-macos-universal-unsigned.tar.gz`. Gatekeeper blocks them on other Macs with a "could not verify" warning; users have to click **Open Anyway** or clear the quarantine flag, as the README's Download section explains. Never publish them as a regular release.
+
+Creating the release creates the tag, which starts the release workflow. It fails (missing secrets, or "a release for v0.2.0 already exists"); that failure is expected and changes nothing.
+
+To check the bundle and DMG locally without publishing, run just the script. Add `TARGETS=aarch64-apple-darwin` to build only for Apple Silicon with Homebrew's Rust; the files are then named `…-macos-aarch64-unsigned…`.

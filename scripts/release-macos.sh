@@ -1,27 +1,33 @@
 #!/usr/bin/env bash
 # Builds the macOS release into dist/:
-#   BNK8-Configurator-<version>-macos-universal.dmg  signed, notarized, stapled app
-#   bnk8-<version>-macos-universal.tar.gz             signed, notarized CLI + README + licenses
+#   BNK8-Configurator-<version>-macos-universal.dmg  app, signed, notarized and stapled
+#   bnk8-<version>-macos-universal.tar.gz             CLI (signed and notarized) + README + licenses
 #   SHA256SUMS.txt
+# With SIGN_IDENTITY=- the files are ad-hoc signed, not notarized, and named
+# ...-macos-universal-unsigned.dmg / .tar.gz; publish those only as a GitHub
+# pre-release titled "unsigned pre-release" (see RELEASING.md).
 #
 # Usage: scripts/release-macos.sh <version>          (version without the leading v)
 #
 # Environment:
-#   SIGN_IDENTITY   "Developer ID Application: Name (TEAMID)", or "-" for an ad-hoc
-#                   signed smoke test that skips notarization and must not be published.
-#   Notarization credentials, one of:
+#   SIGN_IDENTITY   "Developer ID Application: Name (TEAMID)" or its SHA-1 hash,
+#                   or "-" for an ad-hoc signed, unnotarized build.
+#   Notarization credentials (not needed with SIGN_IDENTITY=-), one of:
 #     NOTARY_PROFILE                                        notarytool keychain profile (local)
 #     APPLE_API_KEY_PATH, APPLE_API_KEY_ID, APPLE_API_ISSUER App Store Connect API key (CI)
 #   TARGETS         Rust targets to merge (default: aarch64-apple-darwin x86_64-apple-darwin).
+#
+# The files appear in dist/ only once everything has been built and verified; a
+# failed run leaves its intermediate files in dist/work.
 set -euo pipefail
 
 version=${1:?usage: scripts/release-macos.sh <version>}
-identity=${SIGN_IDENTITY:?set SIGN_IDENTITY to a Developer ID Application identity, or - for a smoke test}
+identity=${SIGN_IDENTITY:?set SIGN_IDENTITY to a Developer ID Application identity, or - for an unsigned build}
 read -r -a targets <<<"${TARGETS:-aarch64-apple-darwin x86_64-apple-darwin}"
 
 app_name="BNK8 Configurator"
 bundle_id="io.github.alexdibattista.bnk8"
-min_macos="11.0"
+min_macos="11.0"  # keep in sync with MACOSX_DEPLOYMENT_TARGET in .github/workflows/release-macos.yml
 icon_master="gui/assets/app-icon/macos-1024.png"  # from scripts/make-macos-icon.py
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -44,14 +50,34 @@ for t in "${targets[@]}"; do
     [[ -d $sysroot/lib/rustlib/$t ]] || die "Rust target $t is not installed: rustup target add $t"
 done
 
+target_dir=$(cargo metadata --format-version 1 --no-deps | plutil -extract target_directory raw -o - -)
+[[ -n $target_dir ]] || die "could not read target_directory from cargo metadata"
+
 notarize=true
 notary_args=()
 if [[ $identity == "-" ]]; then
     notarize=false
-    echo "warning: ad-hoc signature, no notarization: this build must not be published" >&2
+    echo "warning: ad-hoc signature, no notarization: publish only as an unsigned pre-release" >&2
 else
-    security find-identity -v -p codesigning | grep -qF "\"$identity\"" ||
+    # Resolve the identity to its SHA-1 so codesign can't pick a different
+    # certificate with the same name (e.g. an expired one in another keychain).
+    want_hash=""
+    [[ $identity =~ ^[0-9A-Fa-f]{40}$ ]] && want_hash=$(printf '%s' "$identity" | tr a-f A-F)
+    matches=()
+    while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        if [[ ${line%% *} == "$want_hash" || ${line#* } == "$identity" ]]; then matches+=("$line"); fi
+    done < <(security find-identity -v -p codesigning |
+        sed -n 's/^ *[0-9][0-9]*) \([0-9A-F]\{40\}\) "\(.*\)"$/\1 \2/p' | sort -u)
+    if ((${#matches[@]} == 0)); then
         die "signing identity not found in the keychain: $identity"
+    elif ((${#matches[@]} > 1)); then
+        echo "error: several valid identities match \"$identity\":" >&2
+        for m in "${matches[@]}"; do echo "    $m" >&2; done
+        die "set SIGN_IDENTITY to the SHA-1 hash of the one to use"
+    fi
+    identity=${matches[0]%% *}
+    echo "Signing identity: ${matches[0]#* } ($identity)"
     if [[ -n ${NOTARY_PROFILE:-} ]]; then
         notary_args=(--keychain-profile "$NOTARY_PROFILE")
     elif [[ -n ${APPLE_API_KEY_PATH:-} ]]; then
@@ -62,14 +88,29 @@ else
 fi
 
 if ((${#targets[@]} > 1)); then label="macos-universal"; else label="macos-${targets[0]%%-*}"; fi
-dmg="$dist/BNK8-Configurator-$version-$label.dmg"
+$notarize || label="$label-unsigned"
+dmg_name="BNK8-Configurator-$version-$label.dmg"
 cli_dir="bnk8-$version-$label"
-tarball="$dist/$cli_dir.tar.gz"
+tarball_name="$cli_dir.tar.gz"
+# Built in $work and moved to $dist only after verification.
+dmg="$work/$dmg_name"
+tarball="$work/$tarball_name"
 
 # ---- build -------------------------------------------------------------------
 
 rm -rf "$dist"
 mkdir -p "$work"
+finished=false
+on_exit() {
+    $finished && return
+    # Keep dist/work for debugging, but nothing at dist/ top level that looks like a release.
+    find "$dist" -mindepth 1 -maxdepth 1 ! -name work -exec rm -rf {} + 2>/dev/null || true
+    echo "release failed: dist/ holds no release files; intermediate files are in dist/work" >&2
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 export MACOSX_DEPLOYMENT_TARGET=$min_macos
 for t in "${targets[@]}"; do
     step "Building $t"
@@ -78,7 +119,7 @@ done
 
 merge() {
     local name=$1 inputs=()
-    for t in "${targets[@]}"; do inputs+=("${CARGO_TARGET_DIR:-target}/$t/release/$name"); done
+    for t in "${targets[@]}"; do inputs+=("$target_dir/$t/release/$name"); done
     lipo -create "${inputs[@]}" -output "$work/$name"
     echo "    $name: $(lipo -archs "$work/$name")"
 }
@@ -137,9 +178,14 @@ codesign --verify --strict --deep --verbose=2 "$app"
 notarize_file() {
     local file=$1 result="$work/notary.json" status id
     step "Notarizing $(basename "$file") (usually a few minutes)"
-    xcrun notarytool submit "$file" "${notary_args[@]}" --wait --timeout 30m --output-format json >"$result"
-    status=$(plutil -extract status raw -o - "$result")
-    id=$(plutil -extract id raw -o - "$result")
+    # notarytool exits non-zero for Invalid submissions too; judge by its JSON instead.
+    xcrun notarytool submit "$file" "${notary_args[@]}" --wait --timeout 30m --output-format json >"$result" || true
+    cat "$result" >&2
+    echo >&2
+    status=$(plutil -extract status raw -o - "$result" 2>/dev/null) || status=""
+    id=$(plutil -extract id raw -o - "$result" 2>/dev/null) || id=""
+    [[ -n $status && -n $id ]] ||
+        die "notarytool returned no status or submission id for $(basename "$file") (raw output above)"
     if [[ $status != Accepted ]]; then
         xcrun notarytool log "$id" "${notary_args[@]}" >&2 || true
         die "notarization of $(basename "$file") ended with status $status (submission $id)"
@@ -160,7 +206,7 @@ fi
 
 # ---- DMG -----------------------------------------------------------------------
 
-step "Creating $(basename "$dmg")"
+step "Creating $dmg_name"
 dmg_root="$work/dmg"
 mkdir -p "$dmg_root"
 ditto "$app" "$dmg_root/$app_name.app"
@@ -174,13 +220,14 @@ fi
 
 # ---- CLI tarball ---------------------------------------------------------------
 
-step "Creating $(basename "$tarball")"
+step "Creating $tarball_name"
 mkdir -p "$work/$cli_dir"
 ditto "$work/bnk8" "$work/$cli_dir/bnk8"
 cp README.md LICENSE-MIT LICENSE-APACHE "$work/$cli_dir/"
-tar -C "$work" -czf "$tarball" "$cli_dir"
+# No AppleDouble `._*` entries: the code signature is inside the binary, not in xattrs.
+COPYFILE_DISABLE=1 tar --no-mac-metadata -C "$work" -czf "$tarball" "$cli_dir"
 
-# ---- verify and checksum ---------------------------------------------------------
+# ---- verify, checksum and publish to dist/ ---------------------------------------
 
 if $notarize; then
     step "Verifying Gatekeeper acceptance"
@@ -189,7 +236,9 @@ if $notarize; then
     xcrun stapler validate "$dmg"
 fi
 
-(cd "$dist" && shasum -a 256 "$(basename "$dmg")" "$(basename "$tarball")" >SHA256SUMS.txt)
+(cd "$work" && shasum -a 256 "$dmg_name" "$tarball_name" >SHA256SUMS.txt)
+mv "$dmg" "$tarball" "$work/SHA256SUMS.txt" "$dist/"
 rm -rf "$work"
+finished=true
 step "Done"
 ls -lh "$dist"

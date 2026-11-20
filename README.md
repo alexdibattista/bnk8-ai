@@ -23,7 +23,7 @@ Get the latest build from [Releases](https://github.com/alexdibattista/bnk8-ai/r
 - **App:** open `BNK8-Configurator-<version>-macos-universal.dmg` and drag **BNK8 Configurator** to Applications.
 - **CLI:** extract `bnk8-<version>-macos-universal.tar.gz` and move `bnk8` somewhere on your `PATH`, e.g. `/usr/local/bin`.
 
-Releases marked **unsigned** aren't notarized by Apple yet, so macOS blocks them the first time you open them. After the "could not verify" warning, go to **System Settings → Privacy & Security** and click **Open Anyway**. Or clear the download flag in Terminal:
+Releases marked **unsigned** are pre-releases whose file names end in `-unsigned`, e.g. `BNK8-Configurator-<version>-macos-universal-unsigned.dmg`. They aren't notarized by Apple, so macOS blocks them the first time you open them. After the "could not verify" warning, go to **System Settings → Privacy & Security** and click **Open Anyway**. Or clear the download flag in Terminal:
 
 ```sh
 xattr -dr com.apple.quarantine "/Applications/BNK8 Configurator.app"
