@@ -1,2 +1,4 @@
 /target
 /dist
+# Binepad Studio binaries and decompiled source: third-party, never publish.
+/work
