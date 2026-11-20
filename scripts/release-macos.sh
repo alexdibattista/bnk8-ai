@@ -22,6 +22,7 @@ read -r -a targets <<<"${TARGETS:-aarch64-apple-darwin x86_64-apple-darwin}"
 app_name="BNK8 Configurator"
 bundle_id="io.github.alexdibattista.bnk8"
 min_macos="11.0"
+icon_master="gui/assets/app-icon/macos-1024.png"  # from scripts/make-macos-icon.py
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 dist="$root/dist"
@@ -89,7 +90,7 @@ merge bnk8-gui
 
 step "Assembling $app_name.app"
 app="$work/$app_name.app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$work/bnk8-gui" "$app/Contents/MacOS/bnk8-gui"
 cat >"$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -99,6 +100,7 @@ cat >"$app/Contents/Info.plist" <<EOF
     <key>CFBundleDevelopmentRegion</key><string>en</string>
     <key>CFBundleDisplayName</key><string>$app_name</string>
     <key>CFBundleExecutable</key><string>bnk8-gui</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleIdentifier</key><string>$bundle_id</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>$app_name</string>
@@ -113,6 +115,14 @@ cat >"$app/Contents/Info.plist" <<EOF
 </plist>
 EOF
 plutil -lint "$app/Contents/Info.plist" >/dev/null
+
+iconset="$work/AppIcon.iconset"
+mkdir -p "$iconset"
+for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" "$icon_master" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+    sips -z $((size * 2)) $((size * 2)) "$icon_master" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
 
 # ---- sign ----------------------------------------------------------------------
 

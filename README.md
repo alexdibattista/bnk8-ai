@@ -1,3 +1,5 @@
+<p align="center"><img src="gui/assets/app-icon/macos-1024.png" width="128" alt="BNK8 Configurator icon"></p>
+
 # bnk8
 
 Open-source tools for the **Binepad BNK8 AI Edition** macropad (8 keys + a push knob): a command-line tool, a desktop configurator, and documentation of the device's USB protocol.
