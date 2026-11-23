@@ -326,33 +326,42 @@ play_pause/next/previous`, `layer.next`).
 
 - **kind 0 — device action**, dispatched on `param` only (`id` ignored):
 
-  | param | Action | Names used by bnk8 |
+  | param | Action | Names (Binepad Studio's, used by bnk8) |
   |---|---|---|
-  | `0x0004..0x00A4`, `0x00E0..0x00E7` | QMK basic keycode / HID usage | `keyboard.a`, `keyboard.left_ctrl`, `keyboard.numpad.7`… |
+  | `0x0004..0x00A4`, `0x00E0..0x00E7` | QMK basic keycode / HID usage | `keyboard.a`, `keyboard.arrow_up`, `keyboard.numpad.7`…, `modifier.left_control`… |
   | `0x1001..0x1006` | media via table `A9 AA A8 AE AB AC` | `media.volume_up`, `volume_down`, `mute`, `play_pause`, `next`, `previous` |
-  | `0x2001` / `0x2002` | next / previous layer | `layer.next` (Studio name), `layer.previous` `[INFERENCE: name]` |
-  | `0x2100 \| n` | select layer n | `layer.N` |
-  | `0x2300 \| n` .. `0x2350 \| n` | layer momentary/toggle variants | unnamed (`raw.`) |
-  | `0x3000 \| n` | play macro n (n < 15) | `macro.N` |
+  | `0x2001` / `0x2002` | next / previous layer | `layer.next`, `layer.previous` |
+  | `0x2100 + n` | select layer n | `layer.{n+1}` |
+  | `0x2200 + n` | Bluetooth slot (wireless products) | `wireless.bt{n+1}` (bnk8: `raw.`) |
+  | `0x2300 + n` / `0x2310 + n` | momentary / toggle layer n; variants up to `0x2350 \| n` | `layer.mo.{n+1}` / `layer.tg.{n+1}` |
+  | `0x3000 + n` | play macro n (n < 15) | `macro.{n+1}` |
   | `0x4000..0x4012` | numeric accumulator (×10 + digit), use unknown | unnamed |
   | `0x6000` / `01` / `02` | lighting toggle / on / off | `rgb.toggle`, `rgb.on`, `rgb.off` |
   | `0x6003` / `04` | brightness ±13 (cap 180) | `rgb.brightness.up/down` |
   | `0x6005` / `06` | hue shift ±8 `[INFERENCE]` | `rgb.hue.up/down` |
   | `0x6007` / `08` | saturation ±13 `[INFERENCE]` | `rgb.saturation.up/down` |
-  | `0x6009` / `0A` | next / previous effect in the cycle list | `rgb.effect.next/prev` |
+  | `0x6009` / `0A` | next / previous effect in the cycle list | `rgb.effect.next/previous` |
   | `0x600B` / `0C` | speed ±13 | `rgb.speed.up/down` |
-  | `0x600D`..`0x6012` | lighting reset / preset effects | unnamed |
+  | `0x600D` | restore saved lighting | `rgb.restore` |
+  | `0x600E`..`0x6011` | solid / breathing / wave / reactive effect | `rgb.effect.solid/breathing/wave/reactive` |
+  | `0x6012` | rainbow effect (Studio: BNK9/KnobX1 only) | `rgb.effect.rainbow` (bnk8: `raw.`) |
 
-- **kind 1** — dispatched on `id` against firmware constants
-  (`0xA3B315DA`, `0xA3B2C9BE`, `0x4D19FA85`, `0x38895B3E`, …; names
-  not recovered); unmatched ids are forwarded to the host like kind 2.
-- **kind 2 — host action**: forwarded to Studio as a `0x20` async
-  frame (`FUN_08002160`) carrying `[id][param][kind]`. The factory
-  layers 0/1 bind kind-2 "AI" actions that only do something while
-  Studio runs.
+- **kind 1 — desktop action** (Studio's agent): dispatched on `id`
+  against firmware constants (`0xA3B315DA` = `system.edit.undo`,
+  `0x4D19FA85` = `system.window.next`, `0x38895B3E` =
+  `system.edit.select-all`, `0xA3B2C9BE` unknown, …); unmatched ids are
+  forwarded to the host like kind 2. `param` is a native shortcut code
+  (`0x12xx` macOS, `0x11xx` Windows) or 0.
+- **kind 2 — integration action** (Claude, Codex): forwarded to Studio
+  as a `0x20` async frame (`FUN_08002160`) carrying `[id][param][kind]`.
+  The factory layers 0/1 bind kind-2 "AI" actions that only do
+  something while Studio runs.
 
-bnk8 names kind-0 entries whose `id` equals the FNV of its name and
-writes every other entry as `raw.<14 hex>`, byte-for-byte.
+bnk8 names an entry when it is exactly what it would write for that
+name: kind 0 by `param` with the name's FNV as `id`; kind 1/2 by `id`
+from Studio's integration packs (`claude.*`, `codex.*`, `system.*`),
+param 0 or the macOS native param. Every other entry is written as
+`raw.<14 hex>`, byte-for-byte.
 
 ### Macro (29 bytes)
 

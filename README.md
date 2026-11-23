@@ -78,7 +78,7 @@ bnk8 reset                        # restore the factory config
 Change one setting without a file:
 
 ```sh
-bnk8 set key 1 keyboard.up                     # K1 tap = up arrow
+bnk8 set key 1 keyboard.arrow_up               # K1 tap = up arrow
 bnk8 set key 7 keyboard.f9 --slot hold         # K7 hold = F9
 bnk8 set knob cw media.volume_up --layer 2     # knob turn right on layer 2
 bnk8 set lighting --layer 0 --effect 1 --color "#730000" --brightness 80
@@ -89,6 +89,7 @@ Keys are numbered 1 to 8 from top left to bottom right, skipping the knob (top r
 ## Config format
 
 ```toml
+format = 2
 device = "binepad.bnk8"
 
 [timing]
@@ -97,9 +98,9 @@ hold_ms = 350
 
 [[layers]]                     # up to 10 layers
 keys = [
-    "keyboard.up",             # K1 tap only
-    "keyboard.down",           # K2
-    "macro.0",                 # K3 plays macro 0
+    "keyboard.arrow_up",       # K1 tap only
+    "keyboard.arrow_down",     # K2
+    "macro.1",                 # K3 plays macro 1
     "media.play_pause",        # K4
     "none",                    # K5 unbound
     "keyboard.escape",         # K6
@@ -119,24 +120,28 @@ speed = 120
 color = "#730000"
 flags = 1
 
-[macros]                       # up to 15 macros, up to 7 key steps each
-0 = ["press keyboard.left_ctrl", "delay 10", "tap keyboard.q", "delay 10", "release keyboard.left_ctrl"]
+[macros]                       # up to 15 macros (1..15), up to 7 key steps each
+1 = ["press modifier.left_control", "delay 10", "tap keyboard.q", "delay 10", "release modifier.left_control"]
 ```
 
 [`configs/omp.toml`](configs/omp.toml) is a complete real-world config.
 
-**Action names**
+**Action names** are Binepad Studio's, so configs show the same names Studio does.
 
 | Group | Examples |
 |---|---|
-| Keyboard | `keyboard.a`, `keyboard.f13`, `keyboard.left_ctrl`, `keyboard.numpad.7`, `keyboard.page_up` |
+| Keyboard | `keyboard.a`, `keyboard.f13`, `keyboard.arrow_up`, `keyboard.numpad.7`, `keyboard.page_up` |
+| Modifiers | `modifier.left_control`, `modifier.left_shift`, `modifier.left_alt`, `modifier.left_gui`, `modifier.right_*` |
 | Media | `media.volume_up`, `media.volume_down`, `media.mute`, `media.play_pause`, `media.next`, `media.previous` |
-| Layers | `layer.next`, `layer.previous`, `layer.0` … `layer.9` |
-| Lighting | `rgb.toggle`, `rgb.brightness.up`, `rgb.effect.next`, `rgb.speed.down`, … |
-| Macros | `macro.0` … `macro.14` |
-| Other | `none` (unbound); `raw.<14 hex>` for entries bnk8 can't name, e.g. Binepad Studio's AI actions, kept byte for byte |
+| Layers | `layer.next`, `layer.previous`; go to layer `layer.1` … `layer.10`, hold for layer `layer.mo.1` …, toggle layer `layer.tg.1` … (1 = the first layer) |
+| Lighting | `rgb.toggle`, `rgb.brightness.up`, `rgb.effect.next`, `rgb.effect.breathing`, `rgb.restore`, … |
+| Macros | `macro.1` … `macro.15` |
+| Claude, Codex, desktop | `claude.accept`, `codex.task.new`, `system.edit.copy`, … — Binepad Studio's actions. Studio must be running for them to work (a few desktop actions, such as `system.edit.copy`, also run on the keypad on macOS) |
+| Other | `none` (unbound); `raw.<14 hex>` for entries bnk8 can't name, kept byte for byte |
 
-Macro steps are `tap <key>`, `press <key>`, `release <key>` and `delay <ms>` (a multiple of 10, up to 2550 per step). `<key>` is a `keyboard.*` or `media.*` name.
+Macro steps are `tap <key>`, `press <key>`, `release <key>` and `delay <ms>` (a multiple of 10, up to 2550 per step). `<key>` is a `keyboard.*`, `modifier.*` or `media.*` name.
+
+Files without `format = 2` use bnk8's earlier names (`keyboard.up`, `keyboard.left_ctrl`, 0-based `layer.0`/`macro.0`). bnk8 still reads them and converts them; `dump` and Export write the new format.
 
 Keyboard bindings send a single key. For a shortcut like Cmd+Shift+A, put it in a macro and bind `macro.N`.
 

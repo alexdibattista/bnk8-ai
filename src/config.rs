@@ -49,15 +49,31 @@ pub const MAX_EFFECT: u8 = 50;
 pub const MAX_BRIGHTNESS: u8 = 180;
 const NONE: &str = "none";
 
+/// TOML format bnk8 writes. Format 1 (no `format` key) used bnk8's own
+/// action names and 0-based `layer.N`/`macro.N`; it is migrated on read.
+pub const FORMAT: u32 = 2;
+
+fn legacy_format() -> u32 {
+    1
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// First, so it is written first.
+    #[serde(default = "legacy_format")]
+    pub format: u32,
     pub device: String,
     pub timing: Timing,
     pub layers: Vec<Layer>,
-    /// Macro slot (`"0"`..`"14"`) -> steps; referenced as `macro.N`.
+    /// Macro slot (`"1"`..`"15"`, see [`macro_key`]) -> steps; referenced as `macro.N`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub macros: BTreeMap<String, Vec<String>>,
+}
+
+/// The `[macros]` key (and `macro.N` number) of 0-based macro slot `slot`.
+pub fn macro_key(slot: usize) -> String {
+    (slot + 1).to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -253,10 +269,11 @@ pub fn from_blob(b: &Blob) -> Result<Config> {
         for s in raw[1..].chunks(4).take(n) {
             steps.extend(decode_step(s.try_into().unwrap()));
         }
-        macros.insert(m.to_string(), steps);
+        macros.insert(macro_key(m), steps);
     }
 
     Ok(Config {
+        format: FORMAT,
         device: DEVICE.into(),
         timing: Timing {
             double_tap_ms: u16_at(b, OFF_DOUBLE_TAP),
@@ -334,6 +351,7 @@ fn parse_color(s: &str) -> Option<[u8; 3]> {
 
 /// Encodes `cfg` over `base`, rewriting every modelled region.
 pub fn to_blob(cfg: &Config, base: &Blob) -> Result<Blob> {
+    ensure!(cfg.format == FORMAT, "format: {} is not {FORMAT}", cfg.format);
     ensure!(cfg.device == DEVICE, "device: `{}` does not match `{DEVICE}`", cfg.device);
     let n_layers = cfg.layers.len();
     ensure!((1..=MAX_LAYERS).contains(&n_layers), "layers: {n_layers} layers, expected 1..={MAX_LAYERS}");
@@ -426,11 +444,12 @@ pub fn to_blob(cfg: &Config, base: &Blob) -> Result<Blob> {
 
     b[OFF_MACROS..OFF_MACROS + MACRO_SLOTS * MACRO_LEN].fill(0);
     for (slot, steps) in &cfg.macros {
-        let m: usize = slot
+        let m = slot
             .parse()
             .ok()
-            .filter(|m: &usize| *m < MACRO_SLOTS && m.to_string() == *slot)
-            .with_context(|| format!("macros.{slot}: slot must be 0..={}", MACRO_SLOTS - 1))?;
+            .filter(|m: &usize| (1..=MACRO_SLOTS).contains(m) && m.to_string() == *slot)
+            .with_context(|| format!("macros.{slot}: slot must be 1..={MACRO_SLOTS}"))?
+            - 1;
         // The device stores an empty macro as an unused slot, so it would not read back.
         ensure!(!steps.is_empty(), "macros.{slot}: a macro needs at least one step");
         let enc = encode_steps(steps).with_context(|| format!("macros.{slot}"))?;
@@ -455,8 +474,8 @@ fn resolve(name: Option<&String>, cfg: &Config) -> Result<Option<Action>> {
     if let Some(m) = name.strip_prefix("macro.") {
         ensure!(cfg.macros.contains_key(m), "`{name}` has no [macros] entry \"{m}\"");
     }
-    if let Some(n) = name.strip_prefix("layer.").and_then(|n| n.parse::<usize>().ok()) {
-        ensure!(n < cfg.layers.len(), "`{name}`: there are only {} layers", cfg.layers.len());
+    if let Some(t) = actions::layer_target(name) {
+        ensure!(t < cfg.layers.len(), "`{name}`: there are only {} layers", cfg.layers.len());
     }
     Ok(Some(a))
 }
@@ -538,8 +557,60 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
     toml::to_string_pretty(cfg).context("serialising config")
 }
 
+/// Parses a config; format 1 is migrated to the current format.
 pub fn from_toml(text: &str) -> Result<Config> {
-    toml::from_str(text).map_err(|e| anyhow::anyhow!("{e}"))
+    let mut cfg: Config = toml::from_str(text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    match cfg.format {
+        1 => {
+            migrate_v1(&mut cfg);
+            cfg.format = FORMAT;
+        }
+        FORMAT => {}
+        n => bail!("format = {n}: this bnk8 reads formats 1 and 2; update bnk8"),
+    }
+    Ok(cfg)
+}
+
+/// Renames format-1 action names ([`actions::legacy_name`]) in bindings and
+/// macro steps, and shifts canonical `[macros]` keys to 1-based. Other keys
+/// are kept, so [`to_blob`] reports them.
+fn migrate_v1(cfg: &mut Config) {
+    fn rename(v: &mut String) {
+        if let Some(new) = actions::legacy_name(v) {
+            *v = new;
+        }
+    }
+    fn rename_slots(s: &mut Slots) {
+        for n in KNOB_SLOTS {
+            if let Some(v) = s.slot_mut(n).unwrap() {
+                rename(v);
+            }
+        }
+    }
+    for layer in &mut cfg.layers {
+        for key in &mut layer.keys {
+            match key {
+                Key::Tap(a) => rename(a),
+                Key::Slots(s) => rename_slots(s),
+            }
+        }
+        rename_slots(&mut layer.knob);
+    }
+    let macros = std::mem::take(&mut cfg.macros);
+    for (slot, mut steps) in macros {
+        for step in &mut steps {
+            if let Some((verb @ ("tap" | "press" | "release"), key)) = step.split_once(' ')
+                && let Some(new) = actions::legacy_name(key)
+            {
+                *step = format!("{verb} {new}");
+            }
+        }
+        let slot = match slot.parse::<u64>() {
+            Ok(n) if n.to_string() == slot => (n + 1).to_string(),
+            _ => slot,
+        };
+        cfg.macros.insert(slot, steps);
+    }
 }
 
 #[cfg(test)]
@@ -578,14 +649,14 @@ mod tests {
         let back = from_blob(&blob).unwrap();
         assert_eq!(
             diff(&from_blob(FACTORY).unwrap(), &back),
-            ["layers[0].keys[0].tap: raw.fa635be2000002 -> keyboard.a"]
+            ["layers[0].keys[0].tap: codex.task.previous -> keyboard.a"]
         );
         assert_eq!(crc32(&blob[OFF_ACTIONS..]), u32::from_le_bytes(blob[0x14..0x18].try_into().unwrap()));
     }
 
     #[test]
     fn macros_encode_with_delays_and_limits() {
-        let steps: Vec<String> = ["press keyboard.left_gui", "delay 50", "tap keyboard.space", "release keyboard.left_gui"]
+        let steps: Vec<String> = ["press modifier.left_gui", "delay 50", "tap keyboard.space", "release modifier.left_gui"]
             .map(String::from)
             .into();
         let enc = encode_steps(&steps).unwrap();
@@ -628,7 +699,48 @@ mod tests {
         assert!(err(&cfg).contains("unknown action `macro.03`"), "{}", err(&cfg));
 
         let mut cfg = base.clone();
-        cfg.layers[0].keys[0] = Key::Tap(format!("layer.{}", cfg.layers.len()));
+        cfg.layers[0].keys[0] = Key::Tap(format!("layer.{}", cfg.layers.len() + 1));
         assert!(err(&cfg).contains("there are only 4 layers"), "{}", err(&cfg));
+    }
+
+    const V1: &str = r##"
+device = "binepad.bnk8"
+[timing]
+double_tap_ms = 260
+hold_ms = 350
+[[layers]]
+keys = ["keyboard.up", "macro.0", "layer.0", "none", "none", "none", "none", { hold = "keyboard.dot" }]
+[layers.knob]
+tap = "layer.next"
+cw = "rgb.effect.prev"
+[layers.lighting]
+effect = 1
+brightness = 80
+speed = 120
+color = "#730000"
+flags = 1
+[macros]
+0 = ["press keyboard.left_ctrl", "delay 10", "tap keyboard.q", "release keyboard.left_ctrl"]
+"##;
+
+    #[test]
+    fn format_1_is_migrated() {
+        let v2 = V1
+            .replace("device", "format = 2\ndevice")
+            .replace("keyboard.up", "keyboard.arrow_up")
+            .replace("macro.0", "macro.1")
+            .replace("layer.0", "layer.1")
+            .replace("keyboard.dot", "keyboard.period")
+            .replace("rgb.effect.prev", "rgb.effect.previous")
+            .replace("keyboard.left_ctrl", "modifier.left_control")
+            .replace("\n0 = ", "\n1 = ");
+        let old = from_toml(V1).unwrap();
+        let new = from_toml(&v2).unwrap();
+        assert_eq!(old, new);
+        assert_eq!(old.layers[0].keys[0], Key::Tap("keyboard.arrow_up".into()));
+        assert_eq!(old.macros["1"][0], "press modifier.left_control");
+        assert_eq!(to_blob(&old, FACTORY).unwrap(), to_blob(&new, FACTORY).unwrap());
+        let e = from_toml(&v2.replace("format = 2", "format = 3")).unwrap_err().to_string();
+        assert!(e.contains("format = 3"), "{e}");
     }
 }

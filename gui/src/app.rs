@@ -589,7 +589,7 @@ impl App {
 
     /// Edits the selected macro's steps; an emptied macro is removed.
     fn edit_macro(&mut self, f: impl FnOnce(&mut Vec<String>)) {
-        let key = self.macro_slot.to_string();
+        let key = config::macro_key(self.macro_slot);
         let mut steps = self.cfg.macros.remove(&key).unwrap_or_default();
         f(&mut steps);
         if !steps.is_empty() {
@@ -943,14 +943,14 @@ impl App {
 
     fn macros_tab(&self) -> Element<'_, Message> {
         let list = (0..actions::MACRO_SLOTS).map(|m| {
-            let n = self.cfg.macros.get(&m.to_string()).map_or(0, |s| key_steps(s));
+            let n = self.cfg.macros.get(&config::macro_key(m)).map_or(0, |s| key_steps(s));
             let count = match n {
                 0 => "empty".to_string(),
                 1 => "1 step".to_string(),
                 n => format!("{n} steps"),
             };
             let content = row![
-                text(format!("Macro {m}")).size(14).width(Fill),
+                text(format!("Macro {}", m + 1)).size(14).width(Fill),
                 text(count).size(12).style(if n == 0 { style::section } else { style::muted }),
             ]
             .align_y(Alignment::Center);
@@ -973,7 +973,7 @@ impl App {
 
     fn macro_editor(&self) -> Element<'_, Message> {
         let m = self.macro_slot;
-        let steps: &[String] = self.cfg.macros.get(&m.to_string()).map_or(&[], Vec::as_slice);
+        let steps: &[String] = self.cfg.macros.get(&config::macro_key(m)).map_or(&[], Vec::as_slice);
         let n = steps.len();
         let rows = steps.iter().enumerate().map(|(i, step)| {
             let (verb, arg) = parse_step(step);
@@ -1223,15 +1223,10 @@ fn key_steps(steps: &[String]) -> usize {
     steps.iter().filter(|s| !s.starts_with("delay")).count()
 }
 
-/// The layer a canonical `layer.N` action switches to.
-fn layer_index(action: &str) -> Option<usize> {
-    let n = action.strip_prefix("layer.")?;
-    n.parse().ok().filter(|i: &usize| i.to_string() == n)
-}
-
-/// Points `layer.N` bindings at the right layer after layer `removed` was
-/// deleted: later layers shift down by one, bindings to the removed layer are
-/// unbound. Returns how many bindings were unbound.
+/// Points `layer.N`, `layer.mo.N` and `layer.tg.N` bindings at the right
+/// layer after layer `removed` was deleted: later layers shift down by one,
+/// bindings to the removed layer are unbound. Returns how many bindings were
+/// unbound.
 fn renumber_layer_refs(cfg: &mut Config, removed: usize) -> usize {
     let mut cleared = 0;
     for layer in &mut cfg.layers {
@@ -1254,7 +1249,7 @@ fn renumber_slots(slots: &mut Slots, names: &[&str], removed: usize) -> (bool, u
     let (mut changed, mut cleared) = (false, 0);
     for name in names {
         let slot = slots.slot_mut(name).expect("slot name");
-        let Some(n) = slot.as_deref().and_then(layer_index) else { continue };
+        let Some(n) = slot.as_deref().and_then(actions::layer_target) else { continue };
         if n < removed {
             continue;
         }
@@ -1262,7 +1257,7 @@ fn renumber_slots(slots: &mut Slots, names: &[&str], removed: usize) -> (bool, u
             *slot = None;
             cleared += 1;
         } else {
-            *slot = Some(format!("layer.{}", n - 1));
+            *slot = slot.as_deref().and_then(|s| actions::with_layer_target(s, n - 1));
         }
         changed = true;
     }
@@ -1296,17 +1291,18 @@ mod tests {
         let mut cfg = config::from_blob(FACTORY).unwrap();
         cfg.layers = vec![base.clone(), base.clone(), base];
         let keys = &mut cfg.layers[0].keys;
-        keys[0] = Key::Tap("layer.2".into());
-        keys[1] = Key::Slots(Slots { tap: Some("layer.1".into()), hold: Some("layer.2".into()), ..Slots::default() });
-        keys[2] = Key::Tap("layer.0".into());
+        keys[0] = Key::Tap("layer.3".into());
+        keys[1] = Key::Slots(Slots { tap: Some("layer.2".into()), hold: Some("layer.3".into()), ..Slots::default() });
+        keys[2] = Key::Tap("layer.1".into());
         keys[3] = Key::Tap("keyboard.a".into());
         keys[4] = Key::Tap("layer.next".into());
-        keys[5] = Key::Tap("layer.1".into());
+        keys[5] = Key::Tap("layer.2".into());
         keys[6] = Key::Tap("layer.02".into());
+        keys[7] = Key::Tap("layer.mo.3".into());
         cfg.layers[2].knob = Slots {
             hold: Some("layer.next".into()),
-            ccw: Some("layer.1".into()),
-            cw: Some("layer.2".into()),
+            ccw: Some("layer.2".into()),
+            cw: Some("layer.3".into()),
             ..Slots::default()
         };
 
@@ -1314,16 +1310,17 @@ mod tests {
         assert_eq!(renumber_layer_refs(&mut cfg, 1), 3);
 
         let keys = &cfg.layers[0].keys;
-        assert_eq!(keys[0], Key::Tap("layer.1".into()));
-        assert_eq!(keys[1], Key::Slots(Slots { hold: Some("layer.1".into()), ..Slots::default() }));
-        assert_eq!(keys[2], Key::Tap("layer.0".into()));
+        assert_eq!(keys[0], Key::Tap("layer.2".into()));
+        assert_eq!(keys[1], Key::Slots(Slots { hold: Some("layer.2".into()), ..Slots::default() }));
+        assert_eq!(keys[2], Key::Tap("layer.1".into()));
         assert_eq!(keys[3], Key::Tap("keyboard.a".into()));
         assert_eq!(keys[4], Key::Tap("layer.next".into()));
         assert_eq!(keys[5], Key::Tap("none".into()));
         assert_eq!(keys[6], Key::Tap("layer.02".into()));
+        assert_eq!(keys[7], Key::Tap("layer.mo.2".into()));
         assert_eq!(
             cfg.layers[1].knob,
-            Slots { hold: Some("layer.next".into()), cw: Some("layer.1".into()), ..Slots::default() }
+            Slots { hold: Some("layer.next".into()), cw: Some("layer.2".into()), ..Slots::default() }
         );
     }
 }

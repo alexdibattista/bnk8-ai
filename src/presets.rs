@@ -17,7 +17,7 @@ use crate::config::{self, Config, FACTORY, Key, Layer, Lighting, Slots};
 pub enum Act {
     /// An action name, e.g. `keyboard.c`.
     Action(&'static str),
-    /// Modifiers then a key, as `keyboard.*` names without the prefix; played as a macro.
+    /// Modifiers then a key, as full names (`modifier.left_gui`, `keyboard.a`); played as a macro.
     Combo(&'static [&'static str]),
 }
 
@@ -65,64 +65,64 @@ pub const PRESETS: &[Preset] = &[
         name: "Zoom (macOS)",
         legend: ZOOM_LEGEND,
         keys: [
-            Tap(Combo(&["left_gui", "left_shift", "a"])),
-            Tap(Combo(&["left_gui", "left_shift", "v"])),
-            Tap(Combo(&["left_gui", "left_shift", "s"])),
-            Tap(Combo(&["left_alt", "y"])),
-            Tap(Combo(&["left_gui", "left_shift", "h"])),
+            Tap(Combo(&["modifier.left_gui", "modifier.left_shift", "keyboard.a"])),
+            Tap(Combo(&["modifier.left_gui", "modifier.left_shift", "keyboard.v"])),
+            Tap(Combo(&["modifier.left_gui", "modifier.left_shift", "keyboard.s"])),
+            Tap(Combo(&["modifier.left_alt", "keyboard.y"])),
+            Tap(Combo(&["modifier.left_gui", "modifier.left_shift", "keyboard.h"])),
             Hold(Action("keyboard.space")),
             Tap(Action("media.mute")),
-            Hold(Combo(&["left_gui", "w"])),
+            Hold(Combo(&["modifier.left_gui", "keyboard.w"])),
         ],
-        knob_press: Combo(&["left_gui", "left_shift", "a"]),
+        knob_press: Combo(&["modifier.left_gui", "modifier.left_shift", "keyboard.a"]),
         color: ZOOM_BLUE,
     },
     Preset {
         name: "Zoom (Windows/Linux)",
         legend: ZOOM_LEGEND,
         keys: [
-            Tap(Combo(&["left_alt", "a"])),
-            Tap(Combo(&["left_alt", "v"])),
-            Tap(Combo(&["left_alt", "s"])),
-            Tap(Combo(&["left_alt", "y"])),
-            Tap(Combo(&["left_alt", "h"])),
+            Tap(Combo(&["modifier.left_alt", "keyboard.a"])),
+            Tap(Combo(&["modifier.left_alt", "keyboard.v"])),
+            Tap(Combo(&["modifier.left_alt", "keyboard.s"])),
+            Tap(Combo(&["modifier.left_alt", "keyboard.y"])),
+            Tap(Combo(&["modifier.left_alt", "keyboard.h"])),
             Hold(Action("keyboard.space")),
             Tap(Action("media.mute")),
-            Hold(Combo(&["left_alt", "q"])),
+            Hold(Combo(&["modifier.left_alt", "keyboard.q"])),
         ],
-        knob_press: Combo(&["left_alt", "a"]),
+        knob_press: Combo(&["modifier.left_alt", "keyboard.a"]),
         color: ZOOM_BLUE,
     },
     Preset {
         name: "Google Meet (macOS)",
         legend: MEET_LEGEND,
         keys: [
-            Tap(Combo(&["left_gui", "d"])),
-            Tap(Combo(&["left_gui", "e"])),
-            Tap(Combo(&["left_ctrl", "left_gui", "t"])),
-            Tap(Combo(&["left_ctrl", "left_gui", "h"])),
-            Tap(Combo(&["left_ctrl", "left_gui", "c"])),
+            Tap(Combo(&["modifier.left_gui", "keyboard.d"])),
+            Tap(Combo(&["modifier.left_gui", "keyboard.e"])),
+            Tap(Combo(&["modifier.left_control", "modifier.left_gui", "keyboard.t"])),
+            Tap(Combo(&["modifier.left_control", "modifier.left_gui", "keyboard.h"])),
+            Tap(Combo(&["modifier.left_control", "modifier.left_gui", "keyboard.c"])),
             Hold(Action("keyboard.space")),
             Tap(Action("keyboard.c")),
-            Tap(Combo(&["left_ctrl", "left_gui", "p"])),
+            Tap(Combo(&["modifier.left_control", "modifier.left_gui", "keyboard.p"])),
         ],
-        knob_press: Combo(&["left_gui", "d"]),
+        knob_press: Combo(&["modifier.left_gui", "keyboard.d"]),
         color: MEET_GREEN,
     },
     Preset {
         name: "Google Meet (Windows/Linux)",
         legend: MEET_LEGEND,
         keys: [
-            Tap(Combo(&["left_ctrl", "d"])),
-            Tap(Combo(&["left_ctrl", "e"])),
-            Tap(Combo(&["left_ctrl", "left_alt", "t"])),
-            Tap(Combo(&["left_ctrl", "left_alt", "h"])),
-            Tap(Combo(&["left_ctrl", "left_alt", "c"])),
+            Tap(Combo(&["modifier.left_control", "keyboard.d"])),
+            Tap(Combo(&["modifier.left_control", "keyboard.e"])),
+            Tap(Combo(&["modifier.left_control", "modifier.left_alt", "keyboard.t"])),
+            Tap(Combo(&["modifier.left_control", "modifier.left_alt", "keyboard.h"])),
+            Tap(Combo(&["modifier.left_control", "modifier.left_alt", "keyboard.c"])),
             Hold(Action("keyboard.space")),
             Tap(Action("keyboard.c")),
-            Tap(Combo(&["left_ctrl", "left_alt", "p"])),
+            Tap(Combo(&["modifier.left_control", "modifier.left_alt", "keyboard.p"])),
         ],
-        knob_press: Combo(&["left_ctrl", "d"]),
+        knob_press: Combo(&["modifier.left_control", "keyboard.d"]),
         color: MEET_GREEN,
     },
 ];
@@ -130,9 +130,9 @@ pub const PRESETS: &[Preset] = &[
 /// Macro steps for a shortcut: press each modifier, tap the key, release in reverse.
 fn combo_steps(keys: &[&str]) -> Vec<String> {
     let (key, mods) = keys.split_last().expect("combo has a key");
-    let mut steps: Vec<String> = mods.iter().map(|m| format!("press keyboard.{m}")).collect();
-    steps.push(format!("tap keyboard.{key}"));
-    steps.extend(mods.iter().rev().map(|m| format!("release keyboard.{m}")));
+    let mut steps: Vec<String> = mods.iter().map(|m| format!("press {m}")).collect();
+    steps.push(format!("tap {key}"));
+    steps.extend(mods.iter().rev().map(|m| format!("release {m}")));
     steps
 }
 
@@ -142,7 +142,7 @@ fn combo_steps(keys: &[&str]) -> Vec<String> {
 pub fn add(cfg: &mut Config, preset: &Preset, lighting: &Lighting) -> Result<usize> {
     ensure!(cfg.layers.len() < MAX_LAYERS, "the device holds at most {MAX_LAYERS} layers");
     let mut next = cfg.clone();
-    let mut free = (0..MACRO_SLOTS).filter(|m| !cfg.macros.contains_key(&m.to_string()));
+    let mut free = (0..MACRO_SLOTS).map(config::macro_key).filter(|k| !cfg.macros.contains_key(k));
     let mut needed = 0;
     let mut resolve = |act: &Act, next: &mut Config| -> Option<String> {
         let steps = match act {
@@ -154,7 +154,7 @@ pub fn add(cfg: &mut Config, preset: &Preset, lighting: &Lighting) -> Result<usi
         }
         needed += 1;
         let slot = free.next()?;
-        next.macros.insert(slot.to_string(), steps);
+        next.macros.insert(slot.clone(), steps);
         Some(format!("macro.{slot}"))
     };
     let mut keys = Vec::with_capacity(8);
@@ -226,7 +226,7 @@ mod tests {
     fn running_out_of_macro_slots_leaves_the_config_unchanged() {
         let mut cfg = factory();
         for m in 0..MACRO_SLOTS - 2 {
-            cfg.macros.entry(m.to_string()).or_insert_with(|| vec![format!("tap keyboard.{}", m % 9 + 1)]);
+            cfg.macros.entry(config::macro_key(m)).or_insert_with(|| vec![format!("tap keyboard.{}", m % 9 + 1)]);
         }
         let before = cfg.clone();
         let lighting = cfg.layers[0].lighting.clone();

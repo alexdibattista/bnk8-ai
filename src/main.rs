@@ -76,7 +76,7 @@ enum Set {
     Key {
         #[arg(value_parser = clap::value_parser!(u8).range(1..=8))]
         key: u8,
-        /// Action name, e.g. keyboard.a, media.mute, macro.0, none.
+        /// Action name, e.g. keyboard.a, media.mute, macro.1, claude.accept, none.
         action: String,
         #[arg(long, default_value_t = 0)]
         layer: usize,

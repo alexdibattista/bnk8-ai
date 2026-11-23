@@ -12,6 +12,7 @@ use crate::style;
 const RAW_ZERO: &str = "raw.00000000000000";
 const PICKER_WIDTH: u32 = 200;
 
+/// Declaration order must match [`Category::ALL`]: it indexes [`Catalog`]'s groups.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Category {
     None,
@@ -20,41 +21,53 @@ pub enum Category {
     Layer,
     Lighting,
     Macro,
+    Claude,
+    Codex,
+    Desktop,
     Raw,
 }
 
 impl Category {
-    const ALL: [Category; 7] = [
+    const ALL: [Category; 10] = [
         Category::None,
         Category::Keyboard,
         Category::Media,
         Category::Layer,
         Category::Lighting,
         Category::Macro,
+        Category::Claude,
+        Category::Codex,
+        Category::Desktop,
         Category::Raw,
     ];
 
     fn of(name: Option<&str>) -> Category {
         let Some(n) = name else { return Category::None };
         match n.split('.').next().unwrap_or("") {
-            "keyboard" => Category::Keyboard,
+            "keyboard" | "modifier" => Category::Keyboard,
             "media" => Category::Media,
             "layer" => Category::Layer,
             "rgb" => Category::Lighting,
             "macro" => Category::Macro,
+            "claude" => Category::Claude,
+            "codex" => Category::Codex,
+            "system" => Category::Desktop,
             _ => Category::Raw,
         }
     }
 
-    /// Catalog prefix of the category's entries; `None` for categories without a list.
-    fn prefix(self) -> Option<&'static str> {
+    /// Catalog prefixes of the category's entries; empty for categories without a list.
+    fn prefixes(self) -> &'static [&'static str] {
         match self {
-            Category::Keyboard => Some("keyboard."),
-            Category::Media => Some("media."),
-            Category::Layer => Some("layer."),
-            Category::Lighting => Some("rgb."),
-            Category::Macro => Some("macro."),
-            Category::None | Category::Raw => None,
+            Category::Keyboard => &["keyboard.", "modifier."],
+            Category::Media => &["media."],
+            Category::Layer => &["layer."],
+            Category::Lighting => &["rgb."],
+            Category::Macro => &["macro."],
+            Category::Claude => &["claude."],
+            Category::Codex => &["codex."],
+            Category::Desktop => &["system."],
+            Category::None | Category::Raw => &[],
         }
     }
 
@@ -66,6 +79,9 @@ impl Category {
             Category::Layer => "Layer",
             Category::Lighting => "Lighting",
             Category::Macro => "Macro",
+            Category::Claude => "Claude",
+            Category::Codex => "Codex",
+            Category::Desktop => "Desktop",
             Category::Raw => "Raw / Studio",
         }
     }
@@ -106,7 +122,7 @@ impl fmt::Display for Choice {
 pub struct Catalog {
     /// Indexed by `Category as usize`; empty for categories without a list.
     groups: Vec<Vec<Choice>>,
-    /// Keyboard and media keys, for macro steps.
+    /// Keyboard, modifier and media keys, for macro steps.
     keys: Vec<Choice>,
 }
 
@@ -117,8 +133,8 @@ impl Catalog {
             names.iter().filter(|n| prefixes.iter().any(|p| n.starts_with(p))).map(|n| Choice::new(n)).collect()
         };
         Catalog {
-            groups: Category::ALL.iter().map(|c| c.prefix().map_or_else(Vec::new, |p| entries(&[p]))).collect(),
-            keys: entries(&["keyboard.", "media."]),
+            groups: Category::ALL.iter().map(|c| entries(c.prefixes())).collect(),
+            keys: entries(&["keyboard.", "modifier.", "media."]),
         }
     }
 
@@ -148,6 +164,9 @@ pub fn short(name: Option<&str>) -> String {
         }
         return if k.chars().count() == 1 { k.to_uppercase() } else { pretty(k) };
     }
+    if let Some(m) = n.strip_prefix("modifier.") {
+        return pretty(m);
+    }
     if let Some(m) = n.strip_prefix("media.") {
         return match m {
             "volume_up" => "Vol +",
@@ -160,15 +179,26 @@ pub fn short(name: Option<&str>) -> String {
         }
         .into();
     }
-    if let Some(l) = n.strip_prefix("layer.") {
-        return match l {
-            "next" => "Next layer".into(),
-            "previous" => "Prev layer".into(),
-            _ => format!("Layer {l}"),
+    if let Some(t) = actions::layer_target(n) {
+        let what = if n.starts_with("layer.mo.") {
+            "Hold layer"
+        } else if n.starts_with("layer.tg.") {
+            "Toggle layer"
+        } else {
+            "Layer"
         };
+        return format!("{what} {t}");
+    }
+    match n {
+        "layer.next" => return "Next layer".into(),
+        "layer.previous" => return "Prev layer".into(),
+        _ => {}
     }
     if let Some(m) = n.strip_prefix("macro.") {
         return format!("Macro {m}");
+    }
+    if let Some(rest) = ["claude.", "codex.", "system."].iter().find_map(|p| n.strip_prefix(p)) {
+        return pretty(&rest.replace(['.', '-'], " "));
     }
     if let Some(r) = n.strip_prefix("rgb.") {
         return format!("RGB {}", r.replace('.', " "));
@@ -206,9 +236,9 @@ pub fn macro_summary(steps: &[String]) -> String {
 
 /// Key name in a shortcut; modifiers use the host's names.
 fn key_label(name: &str) -> String {
-    let modifier = name.strip_prefix("keyboard.").and_then(|k| k.strip_prefix("left_").or(k.strip_prefix("right_")));
+    let modifier = name.strip_prefix("modifier.").and_then(|k| k.strip_prefix("left_").or(k.strip_prefix("right_")));
     match modifier {
-        Some("ctrl") => "Ctrl".into(),
+        Some("control") => "Ctrl".into(),
         Some("shift") => "Shift".into(),
         Some("alt") if cfg!(target_os = "macos") => "Opt".into(),
         Some("alt") => "Alt".into(),
@@ -297,7 +327,10 @@ mod tests {
     #[test]
     fn labels_are_readable() {
         assert_eq!(short(Some("keyboard.a")), "A");
-        assert_eq!(short(Some("keyboard.left_ctrl")), "Left ctrl");
+        assert_eq!(short(Some("modifier.left_control")), "Left control");
+        assert_eq!(short(Some("layer.1")), "Layer 0");
+        assert_eq!(short(Some("layer.mo.3")), "Hold layer 2");
+        assert_eq!(short(Some("claude.code.session.previous")), "Code session previous");
         assert_eq!(short(Some("keyboard.numpad.7")), "Num 7");
         assert_eq!(short(Some("raw.dfddf9e8000002")), "Studio action");
         assert_eq!(short(None), "-");
@@ -311,9 +344,9 @@ mod tests {
     #[test]
     fn macros_read_as_shortcuts() {
         let steps = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let combo = steps(&["press keyboard.left_ctrl", "press keyboard.left_shift", "tap keyboard.a", "release keyboard.left_shift", "release keyboard.left_ctrl"]);
+        let combo = steps(&["press modifier.left_control", "press modifier.left_shift", "tap keyboard.a", "release modifier.left_shift", "release modifier.left_control"]);
         assert_eq!(macro_summary(&combo), "Ctrl+Shift+A");
-        let sequence = steps(&["press keyboard.left_ctrl", "tap keyboard.c", "release keyboard.left_ctrl", "delay 100", "tap keyboard.v"]);
+        let sequence = steps(&["press modifier.left_control", "tap keyboard.c", "release modifier.left_control", "delay 100", "tap keyboard.v"]);
         assert_eq!(macro_summary(&sequence), "Ctrl+C V");
     }
 }

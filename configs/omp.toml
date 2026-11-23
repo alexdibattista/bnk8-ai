@@ -1,3 +1,4 @@
+format = 2
 device = "binepad.bnk8"
 
 [timing]
@@ -6,14 +7,14 @@ hold_ms = 350
 
 [[layers]]
 keys = [
-    "keyboard.up",                 # K1: up arrow
-    "keyboard.down",               # K2: down arrow
-    "macro.2",                     # K3: new omp chat in a tmux window, current folder (prefix C-s, a)
+    "keyboard.arrow_up",           # K1: up arrow
+    "keyboard.arrow_down",         # K2: down arrow
+    "macro.3",                     # K3: new omp chat in a tmux window, current folder (prefix C-s, a)
     "keyboard.f6",                 # K4: omp copy last reply as Markdown (F6, ~/.omp/agent/extensions/bnk8-macropad.ts)
     "keyboard.f10",                # K5: omp /branch picker (F10 = app.session.fork, see ~/.omp/agent/keybindings.yml)
-    "macro.1",                     # K6: omp reject (Esc)
+    "macro.2",                     # K6: omp reject (Esc)
     { hold = "keyboard.f9" },      # K7: hold = omp push-to-talk (F9, see ~/.omp/agent/keybindings.yml)
-    "macro.0",                     # K8: omp accept (Ctrl+Q)
+    "macro.1",                     # K8: omp accept (Ctrl+Q)
 ]
 
 [layers.knob]                       # press: next layer; turn: omp effort (F7/F8, ~/.omp/agent/extensions/bnk8-macropad.ts)
@@ -30,14 +31,14 @@ flags = 1
 
 [[layers]]
 keys = [
-    "raw.3f4d5904000002",
-    "raw.67c88f2d000002",
-    "raw.bd7302e6000002",
-    "raw.f1db1315000002",
-    "raw.165687f0000002",
-    "raw.403d6e25000002",
-    { tap = "raw.0f6407ea000002", hold = "raw.0f6407ea000002" },
-    "raw.dfddf9e8000002",
+    "claude.code.session.previous",
+    "claude.code.session.next",
+    "claude.chat.new",
+    "claude.fast.toggle",
+    "claude.code.session.fork",
+    "claude.reject",
+    { tap = "claude.voice", hold = "claude.voice" },
+    "claude.accept",
 ]
 
 [layers.knob]
@@ -56,9 +57,9 @@ flags = 1
 keys = [
     "media.previous",
     "media.next",
-    "raw.6bbc48b6000001",
+    "system.media.rewind",
     "media.play_pause",
-    "raw.bec97270000001",
+    "system.media.fast-forward",
     "media.mute",
     "media.volume_down",
     "media.volume_up",
@@ -102,7 +103,7 @@ flags = 1
 
 # omp CLI shortcuts (see omp keybindings: app.approval.approve, Esc, app.stt.pushToTalk).
 [macros]
-0 = ["press keyboard.left_ctrl", "delay 10", "tap keyboard.q", "delay 10", "release keyboard.left_ctrl"]
-1 = ["tap keyboard.escape"]
+1 = ["press modifier.left_control", "delay 10", "tap keyboard.q", "delay 10", "release modifier.left_control"]
+2 = ["tap keyboard.escape"]
 # tmux prefix (C-s) then `a`: see `bind a new-window ...` in ~/.tmux.conf.
-2 = ["press keyboard.left_ctrl", "delay 10", "tap keyboard.s", "delay 10", "release keyboard.left_ctrl", "delay 20", "tap keyboard.a"]
+3 = ["press modifier.left_control", "delay 10", "tap keyboard.s", "delay 10", "release modifier.left_control", "delay 20", "tap keyboard.a"]
