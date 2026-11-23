@@ -84,15 +84,25 @@ pub struct DeviceId {
     pub uid: [u8; 12],
 }
 
-/// Reply to [`Bnk8::stream_status`] (`0x15` sub 0).
+/// Stream phase in which the profile store is ready to read or save.
+pub const PHASE_IDLE: u8 = 2;
+
+/// Reply to [`Bnk8::stream_status`] (`0x15` sub 0): the portable profile
+/// store's state (PROTOCOL.md `0x15`, docs/STUDIO.md §5).
 #[derive(Debug)]
 pub struct StreamStatus {
-    /// Stream state machine value; 2 = idle/ready.
-    pub state: u8,
-    /// Current stream token; 0 when no valid slot exists.
-    pub token: u32,
-    /// Declared stream data size of the active slot.
-    pub size: u16,
+    /// Store phase, 0..=11; [`PHASE_IDLE`] = ready.
+    pub phase: u8,
+    /// Revision of the stored profile; 0 when no valid slot exists.
+    pub revision: u32,
+    /// Length of the stored native config (2000 on the BNK8).
+    pub native_len: u16,
+    /// Length of the profile archive stored after the native config.
+    pub archive_len: u16,
+    /// Archive capacity (`0x1810` on the BNK8).
+    pub capacity: u16,
+    /// CRC-32 of the stored native config plus archive.
+    pub payload_crc: u32,
 }
 
 impl Bnk8 {
@@ -209,13 +219,17 @@ impl Bnk8 {
         })
     }
 
-    /// `0x15` sub 0: stream session status.
+    /// `0x15` sub 0: profile store status.
     pub fn stream_status(&self) -> Result<StreamStatus> {
         let p = self.stream_status_payload()?;
+        let u16_at = |i: usize| u16::from_le_bytes([p[i], p[i + 1]]);
         Ok(StreamStatus {
-            state: p[1],
-            token: u32::from_le_bytes(p[2..6].try_into().unwrap()),
-            size: u16::from_le_bytes([p[8], p[9]]),
+            phase: p[1],
+            revision: u32::from_le_bytes(p[2..6].try_into().unwrap()),
+            native_len: u16_at(6),
+            archive_len: u16_at(8),
+            capacity: u16_at(10),
+            payload_crc: u32::from_le_bytes(p[16..20].try_into().unwrap()),
         })
     }
 
@@ -288,6 +302,24 @@ impl Bnk8 {
         Ok(f.payload().to_vec())
     }
 
+    /// Reads the first `len` bytes (native config, then archive) of the
+    /// profile store's slot `revision` with repeated `0x15` sub-1 reads.
+    pub fn profile_store_read(&self, revision: u32, len: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            let offset = out.len();
+            let n = (len - offset).min(22);
+            let chunk = self.stream_read(revision, offset as u16, n as u8)?;
+            ensure!(
+                chunk.len() == n,
+                "profile store read at {offset}: {} bytes, expected {n}",
+                chunk.len()
+            );
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
     /// `0x11` sub 0: begin a flash-persist transfer session (empty buffer,
     /// all 2000 bytes must be supplied via sub-1 chunks). Requires the
     /// `0x10` token A only. `crc` is the expected CRC-32 of the final
@@ -344,8 +376,8 @@ impl Bnk8 {
     /// otherwise). On success the device's token B equals the blob's CRC.
     pub fn write_config(&self, blob: &[u8; CONFIG_LEN]) -> Result<()> {
         let stream = self.stream_status()?;
-        if stream.state != 2 {
-            self.stream_finish(stream.token)
+        if stream.phase != PHASE_IDLE {
+            self.stream_finish(stream.revision)
                 .context("resetting the stream manager before a config write")?;
         }
         let crc = crc32(blob);

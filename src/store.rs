@@ -1,21 +1,25 @@
-//! Local snapshot of the last config bnk8 wrote, per device serial.
+//! Identifying the device's active config, and the local snapshot of the
+//! last config bnk8 wrote, per device serial.
 //!
-//! The device cannot read its config back (PROTOCOL.md "The read model"),
-//! but `0x10` status token B is the CRC-32 of the active config. A snapshot
-//! (or the factory blob) whose CRC equals token B is therefore exactly what
-//! the device holds.
+//! `0x10` status token B is the CRC-32 of the active config, so any blob
+//! whose CRC equals token B is exactly what the device holds. There are three
+//! candidates, cheapest first (PROTOCOL.md "The read model"): bnk8's local
+//! snapshot, the factory config, and the copy of the native config in the
+//! device's profile store, which Binepad Studio writes when it saves.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use crate::config::{Blob, FACTORY};
-use crate::protocol::crc32;
+use crate::protocol::{CONFIG_LEN, Nak, PHASE_IDLE, crc32};
 use crate::transport::Bnk8;
 
 pub enum Source {
     Snapshot,
     Factory,
+    /// Read back from the device's profile store (last saved by Binepad Studio).
+    ProfileStore,
 }
 
 /// The device's current config, if bnk8 can identify it.
@@ -48,6 +52,20 @@ pub fn current(dev: &Bnk8) -> Result<Current> {
     }
     if crc32(FACTORY) == crc {
         return Ok(Current::Known(Box::new(*FACTORY), Source::Factory));
+    }
+    // Firmware without the profile store NAKs the status request.
+    let stream = match dev.stream_status() {
+        Ok(s) => s,
+        Err(e) if e.downcast_ref::<Nak>().is_some() => return Ok(Current::Unknown { crc }),
+        Err(e) => return Err(e),
+    };
+    if stream.phase == PHASE_IDLE && stream.revision != 0 && stream.native_len as usize == CONFIG_LEN {
+        let bytes = dev.profile_store_read(stream.revision, CONFIG_LEN)?;
+        let blob = Blob::try_from(bytes.as_slice()).unwrap();
+        if crc32(&blob) == crc {
+            // Not saved as a snapshot: the snapshot records bnk8's own writes.
+            return Ok(Current::Known(Box::new(blob), Source::ProfileStore));
+        }
     }
     Ok(Current::Unknown { crc })
 }

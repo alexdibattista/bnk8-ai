@@ -146,11 +146,11 @@ Keep a `layer.next` binding (factory: knob press) on every layer so you can alwa
 
 ## How reading the config works
 
-The device has no command to read its config back. It does report a CRC-32 of the active config, so bnk8 saves every config it writes to `~/.local/state/bnk8/<serial>.bin` (or `$XDG_STATE_HOME/bnk8/`). It trusts that file, or the built-in factory config, only when its CRC matches the device.
+The device reports a CRC-32 of its active config, and bnk8 trusts a config only when its CRC matches. It looks in three places: the file it saves after every write (`~/.local/state/bnk8/<serial>.bin`, or `$XDG_STATE_HOME/bnk8/`), the built-in factory config, and the copy Binepad Studio keeps on the device when it saves.
 
-If the device was last programmed by another tool (such as Binepad Studio), its config shows as **unknown**: editing starts from the factory defaults, and applying writes the whole config. Every write replaces all 2000 bytes; the per-item changes shown are for your review.
+If none of them matches (for example, another tool wrote the config), it shows as **unknown**: editing starts from the factory defaults, and applying writes the whole config. Every write replaces all 2000 bytes; the per-item changes shown are for your review.
 
-Details are in [`PROTOCOL.md`](PROTOCOL.md). bnk8 never sends the firmware-update command.
+Details are in [`PROTOCOL.md`](PROTOCOL.md). bnk8 never sends message `0x42` (factory reset or a flash rewrite; unresolved).
 
 ## License
 

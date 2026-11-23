@@ -57,7 +57,8 @@ impl fmt::Display for Device {
 /// What the app knows about the connected device.
 struct Connected {
     serial: String,
-    /// The device's config, when bnk8 can prove it (snapshot/factory CRC match).
+    /// The device's config, when bnk8 can prove it (CRC match with the
+    /// snapshot, the factory config or the profile store's copy).
     config: Option<Box<Blob>>,
     source: &'static str,
 }
@@ -302,6 +303,7 @@ impl App {
             let read = match store::current(&dev)? {
                 Current::Known(blob, Source::Factory) => Read::Known(blob, "factory default"),
                 Current::Known(blob, Source::Snapshot) => Read::Known(blob, "last written by bnk8"),
+                Current::Known(blob, Source::ProfileStore) => Read::Known(blob, "saved by Binepad Studio"),
                 Current::Unknown { crc } => Read::Unknown { crc },
             };
             Ok(Done::Loaded { serial: dev.serial().to_string(), read })
@@ -343,8 +345,9 @@ impl App {
                     }
                     Read::Unknown { crc } => {
                         self.error(format!(
-                            "This device's config (CRC {crc:#010x}) was written by another tool and cannot be read back. \
-                             Editing starts from the factory defaults; Apply writes the whole config."
+                            "This device's config (CRC {crc:#010x}) can't be identified: it isn't bnk8's last write, \
+                             the factory config, or the copy Studio stores on the device. Editing starts from the \
+                             factory defaults; Apply writes the whole config."
                         ));
                         (None, "unknown")
                     }

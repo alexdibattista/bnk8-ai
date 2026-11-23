@@ -26,8 +26,8 @@ enum Command {
     List,
     /// Print device identity, firmware and config state.
     Info,
-    /// Write the device's config as TOML (from the verified local snapshot;
-    /// the device has no config read-back).
+    /// Write the device's config as TOML (read from the device's profile
+    /// store or the verified local snapshot).
     Dump {
         /// Output file; stdout when omitted.
         #[arg(short, long)]
@@ -144,8 +144,8 @@ fn main() -> Result<()> {
 
 fn unknown_config(crc: u32) -> anyhow::Error {
     anyhow::anyhow!(
-        "the device's config (CRC {crc:#010x}) was not written by bnk8 on this machine and \
-         cannot be read back; run `bnk8 reset` or `bnk8 apply FILE` with a complete config first"
+        "the device's config (CRC {crc:#010x}) matches neither bnk8's snapshot, the factory config, \
+         nor the device's profile store; run `bnk8 reset` or `bnk8 apply FILE` with a complete config first"
     )
 }
 
@@ -258,13 +258,13 @@ const STREAM_SIZE: u16 = 0x30; // minimum accepted stream payload size
 fn poll_state(dev: &transport::Bnk8, want: u8, tries: u32) -> Result<protocol::StreamStatus> {
     for _ in 0..tries {
         let s = dev.stream_status()?;
-        println!("  state={} token={:#010x} size={:#06x}", s.state, s.token, s.size);
-        if s.state == want {
+        println!("  phase={} revision={:#010x} archive={:#06x}", s.phase, s.revision, s.archive_len);
+        if s.phase == want {
             return Ok(s);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    bail!("stream state never reached {want}");
+    bail!("stream phase never reached {want}");
 }
 
 /// Drive the `0x15` stream write flow to create a valid stream slot,
@@ -272,14 +272,14 @@ fn poll_state(dev: &transport::Bnk8, want: u8, tries: u32) -> Result<protocol::S
 fn probe_stream(serial: Option<&str>) -> Result<()> {
     let dev = transport::open(serial)?;
     let s = dev.stream_status()?;
-    println!("before: state={} token={:#010x} size={:#06x}", s.state, s.token, s.size);
+    println!("before: phase={} revision={:#010x} archive={:#06x}", s.phase, s.revision, s.archive_len);
     let total = protocol::CONFIG_LEN + STREAM_SIZE as usize;
     let data = vec![0u8; total];
     let crc = protocol::crc32(&data);
-    println!("begin: token={:#010x} size={STREAM_SIZE:#06x} crc={crc:#010x}", s.token);
-    dev.stream_begin(s.token, STREAM_SIZE, crc)?;
+    println!("begin: revision={:#010x} archive={STREAM_SIZE:#06x} crc={crc:#010x}", s.revision);
+    dev.stream_begin(s.revision, STREAM_SIZE, crc)?;
     poll_state(&dev, 4, 40)?;
-    println!("state 4 (ready for data), pushing {total} zero bytes");
+    println!("phase 4 (ready for data), pushing {total} zero bytes");
     let mut sent = 0usize;
     let mut retries = 0u32;
     while sent < total {
@@ -291,7 +291,7 @@ fn probe_stream(serial: Option<&str>) -> Result<()> {
                 if sent % 256 < 16 {
                     let p = dev.stream_status_payload()?;
                     println!(
-                        "  {sent}/{total} state={} counter={}",
+                        "  {sent}/{total} phase={} counter={}",
                         p[1],
                         u16::from_le_bytes([p[12], p[13]])
                     );
@@ -305,13 +305,13 @@ fn probe_stream(serial: Option<&str>) -> Result<()> {
         }
     }
     println!("all data accepted, waiting for finalize");
-    let s = poll_state(&dev, 2, 60)?;
-    ensure!(s.token != 0, "stream slot still invalid after write");
-    let readback = dev.stream_read(s.token, 0, 16)?;
+    let s = poll_state(&dev, protocol::PHASE_IDLE, 60)?;
+    ensure!(s.revision != 0, "stream slot still invalid after write");
+    let readback = dev.stream_read(s.revision, 0, 16)?;
     println!(
-        "slot valid: token={:#010x} size={:#06x} read[0..16]={}",
-        s.token,
-        s.size,
+        "slot valid: revision={:#010x} archive={:#06x} read[0..16]={}",
+        s.revision,
+        s.archive_len,
         to_hex(&readback)
     );
     Ok(())
@@ -320,10 +320,10 @@ fn probe_stream(serial: Option<&str>) -> Result<()> {
 fn probe_finish(serial: Option<&str>) -> Result<()> {
     let dev = transport::open(serial)?;
     let s = dev.stream_status()?;
-    println!("before: state={} token={:#010x}", s.state, s.token);
-    dev.stream_finish(s.token)?;
+    println!("before: phase={} revision={:#010x}", s.phase, s.revision);
+    dev.stream_finish(s.revision)?;
     let s = dev.stream_status()?;
-    println!("after:  state={} token={:#010x}", s.state, s.token);
+    println!("after:  phase={} revision={:#010x}", s.phase, s.revision);
     Ok(())
 }
 
@@ -384,6 +384,7 @@ fn info(serial: Option<&str>) -> Result<()> {
             let source = match source {
                 Source::Factory => "factory default",
                 Source::Snapshot => "matches the local snapshot",
+                Source::ProfileStore => "read from the device (saved by Binepad Studio)",
             };
             println!(
                 "  config:    {source}, CRC {:#010x}, {} layers, {} macros",
