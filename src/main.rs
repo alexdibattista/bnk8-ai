@@ -410,9 +410,13 @@ fn raw(serial: Option<&str>, hex: &str, seal: bool, listen_ms: u64) -> Result<()
     if seal {
         frame::seal(&mut report);
     }
-    // 0x42 erases and rewrites the application flash (PROTOCOL.md); never send it.
+    // 0x42 is Studio's factory reset, or an application flash rewrite per PROTOCOL.md's
+    // firmware analysis; unresolved, so never send it.
     if report[..2] == frame::MAGIC && report[4] == 0x42 {
-        bail!("refusing to send msg 0x42 (firmware update): it can brick the device");
+        bail!(
+            "refusing to send msg 0x42 (factory reset, or an application flash rewrite per PROTOCOL.md; \
+             unresolved): it can brick the device"
+        );
     }
 
     let dev = transport::open(serial)?;
