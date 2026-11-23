@@ -203,17 +203,21 @@ fn studio_action(name: &str) -> Option<Action> {
     Some(Action { id: fnv1a(name), param, kind })
 }
 
+/// Decodes a string of hex digit pairs; `None` on odd length or any non-hex
+/// character (`from_str_radix` alone would accept a `+` sign).
+pub(crate) fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+}
+
 /// Encodes a dotted action name. `none` is handled by the caller (keymap index 0).
 pub fn encode(name: &str) -> Result<Action> {
     if let Some(hex) = name.strip_prefix("raw.") {
-        let ok = hex.len() == ENTRY_LEN * 2 && hex.bytes().all(|c| c.is_ascii_hexdigit());
-        if !ok {
+        let Some(b) = unhex(hex).and_then(|v| <[u8; ENTRY_LEN]>::try_from(v).ok()) else {
             bail!("`{name}`: raw actions are `raw.` + 14 hex digits");
-        }
-        let mut b = [0u8; ENTRY_LEN];
-        for (i, out) in b.iter_mut().enumerate() {
-            *out = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
-        }
+        };
         let a = Action::from_bytes(&b);
         if a.kind > 2 {
             bail!("`{name}`: action kind {} out of range 0..=2", a.kind);
@@ -338,6 +342,14 @@ mod tests {
         assert_eq!(decode(a), "media.volume_up");
         let a = encode("layer.next").unwrap();
         assert_eq!(a.to_bytes(), [0x19, 0xbf, 0x67, 0x69, 0x01, 0x20, 0x00]);
+    }
+
+    #[test]
+    fn unhex_rejects_signs_and_odd_lengths() {
+        assert_eq!(unhex("0aFf"), Some(vec![0x0a, 0xff]));
+        assert_eq!(unhex("+1"), None, "from_str_radix alone accepts a sign");
+        assert_eq!(unhex("abc"), None);
+        assert!(encode("raw.+1020304050607").is_err());
     }
 
     #[test]

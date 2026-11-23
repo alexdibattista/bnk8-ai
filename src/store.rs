@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 
 use crate::archive;
 use crate::config::{Blob, FACTORY, OLDER_FACTORY, older_factory};
-use crate::protocol::{CONFIG_LEN, Nak, PHASE_IDLE, crc32};
+use crate::protocol::{CONFIG_LEN, Nak, PHASE_IDLE, STREAM_SIZE_MAX, crc32};
 use crate::transport::Bnk8;
 
 pub enum Source {
@@ -41,6 +41,16 @@ fn dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/state/bnk8"))
 }
 
+/// The snapshot's bytes; `None` when there is none yet. Other I/O errors
+/// propagate, so an unreadable snapshot is not mistaken for an unknown config.
+fn read_snapshot(p: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(p) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading the snapshot {}", p.display())),
+    }
+}
+
 fn path(serial: &str) -> Result<PathBuf> {
     Ok(dir()?.join(format!("{serial}.bin")))
 }
@@ -49,7 +59,7 @@ pub fn current(dev: &Bnk8) -> Result<Current> {
     let crc = dev.status()?.token_b;
     // Without a state directory there is no snapshot, but the factory check still applies.
     if let Ok(p) = path(dev.serial())
-        && let Ok(bytes) = std::fs::read(&p)
+        && let Some(bytes) = read_snapshot(&p)?
         && let Ok(blob) = Blob::try_from(bytes.as_slice())
         && crc32(&blob) == crc
     {
@@ -67,7 +77,11 @@ pub fn current(dev: &Bnk8) -> Result<Current> {
         Err(e) if e.downcast_ref::<Nak>().is_some() => return Ok(Current::Unknown { crc }),
         Err(e) => return Err(e),
     };
-    if stream.phase == PHASE_IDLE && stream.revision != 0 && stream.native_len as usize == CONFIG_LEN {
+    if stream.phase == PHASE_IDLE
+        && stream.revision != 0
+        && stream.native_len as usize == CONFIG_LEN
+        && stream.archive_len <= STREAM_SIZE_MAX
+    {
         let payload = dev.profile_store_read(stream.revision, CONFIG_LEN + stream.archive_len as usize)?;
         let blob = Blob::try_from(&payload[..CONFIG_LEN]).unwrap();
         if crc32(&blob) == crc {

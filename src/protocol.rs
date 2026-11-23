@@ -304,7 +304,10 @@ impl Bnk8 {
 
     /// Reads the first `len` bytes (native config, then archive) of the
     /// profile store's slot `revision` with repeated `0x15` sub-1 reads.
+    /// `len` is at most the stream area, `CONFIG_LEN + STREAM_SIZE_MAX`.
     pub fn profile_store_read(&self, revision: u32, len: usize) -> Result<Vec<u8>> {
+        let max = CONFIG_LEN + STREAM_SIZE_MAX as usize;
+        ensure!(len <= max, "profile store read of {len} bytes exceeds the {max}-byte stream area");
         let mut out = Vec::with_capacity(len);
         while out.len() < len {
             let offset = out.len();

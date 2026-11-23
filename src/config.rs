@@ -306,16 +306,6 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
-        .collect()
-}
-
 /// Decodes a blob. Fails only on blobs the firmware itself would reject.
 pub fn from_blob(b: &Blob) -> Result<Config> {
     ensure!(b[..4] == MAGIC, "config magic {:02x?}, expected BPN8", &b[..4]);
@@ -413,7 +403,7 @@ fn encode_steps(steps: &[String]) -> Result<Vec<[u8; 4]>> {
     for (i, step) in steps.iter().enumerate() {
         let ctx = || format!("[{i}] `{step}`");
         if let Some(raw) = step.strip_prefix("raw.") {
-            let bytes = unhex(raw).filter(|v| v.len() == 4).with_context(|| {
+            let bytes = actions::unhex(raw).filter(|v| v.len() == 4).with_context(|| {
                 format!("{}: raw steps are `raw.` + 8 hex digits", ctx())
             })?;
             ensure!(delay == 0, "{}: a delay cannot precede a raw step", ctx());
@@ -448,7 +438,7 @@ fn encode_steps(steps: &[String]) -> Result<Vec<[u8; 4]>> {
 
 fn parse_color(s: &str) -> Option<[u8; 3]> {
     let h = s.strip_prefix('#').filter(|h| h.len() == 6)?;
-    unhex(h)?.try_into().ok()
+    actions::unhex(h)?.try_into().ok()
 }
 
 fn rgb_hex(c: &[u8]) -> String {
@@ -490,7 +480,7 @@ fn encode_lighting(l: &Lighting, path: &str) -> Result<[u8; LIGHTING_LEN]> {
     let mut out = [0u8; LIGHTING_LEN];
     out[..7].copy_from_slice(&[l.effect, l.brightness, l.speed, 0, rgb[0], rgb[1], rgb[2]]);
     if let Some(x) = &l.extra {
-        let bytes = unhex(x)
+        let bytes = actions::unhex(x)
             .filter(|v| v.len() == LIGHTING_LEN - LIGHTING_EXTRA)
             .with_context(|| format!("{path}.extra: expected {} hex bytes", LIGHTING_LEN - LIGHTING_EXTRA))?;
         out[LIGHTING_EXTRA..].copy_from_slice(&bytes);
@@ -719,7 +709,7 @@ pub fn to_toml(cfg: &Config) -> Result<String> {
 
 /// Parses a config; format 1 is migrated to the current format.
 pub fn from_toml(text: &str) -> Result<Config> {
-    let mut cfg: Config = toml::from_str(text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut cfg: Config = toml::from_str(text)?;
     match cfg.format {
         1 => {
             migrate_v1(&mut cfg);
