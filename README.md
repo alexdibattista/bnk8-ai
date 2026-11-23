@@ -58,7 +58,7 @@ cargo run --release -p bnk8-gui
 
 Plug the BNK8 in first; the app finds and loads it on startup (press **Refresh** if you plug it in later).
 
-- **Keys & lighting**: click a key or the knob on the keypad, then choose what each gesture does (tap, double tap, hold, tap then hold; the knob also has turn left/right). Set the layer's effect, brightness, speed and colour.
+- **Keys & lighting**: click a key or the knob on the keypad, then choose what each gesture does (tap, double tap, hold, tap then hold; the knob also has turn left/right). Set the layer's effect, brightness, speed and colour, a colour per key, and whether every layer shares one lighting setup.
 - **Macros**: up to 15 macros of up to 7 key steps, with optional delays.
 - **Timing**: double-tap window and hold threshold.
 - **Layer templates**: **+ Add from template…** adds a ready-made layer for **Zoom** or **Google Meet** (macOS or Windows/Linux shortcuts). Shortcuts with modifier keys are stored as macros, so each template uses up to 6 free macro slots.
@@ -81,7 +81,7 @@ Change one setting without a file:
 bnk8 set key 1 keyboard.arrow_up               # K1 tap = up arrow
 bnk8 set key 7 keyboard.f9 --slot hold         # K7 hold = F9
 bnk8 set knob cw media.volume_up --layer 2     # knob turn right on layer 2
-bnk8 set lighting --layer 0 --effect 1 --color "#730000" --brightness 80
+bnk8 set lighting --layer 0 --effect solid --color "#730000" --brightness 80
 ```
 
 Keys are numbered 1 to 8 from top left to bottom right, skipping the knob (top right). With several devices attached, add `--serial <SERIAL>` (see `bnk8 list`).
@@ -114,11 +114,12 @@ ccw = "media.volume_down"
 cw = "media.volume_up"
 
 [layers.lighting]
-effect = 1                     # 0 = off, up to 50
+effect = "solid"               # off, solid, breathing, wave, reactive, … or an id up to 50
 brightness = 80                # up to 180
 speed = 120
 color = "#730000"
-flags = 1
+key_colors = ["none", "none", "#00FF00", "none", "none", "none", "none", "none"]  # optional, K1..K8
+# shared = true                # same lighting on every layer (set it on all layers)
 
 [macros]                       # up to 15 macros (1..15), up to 7 key steps each
 1 = ["press modifier.left_control", "delay 10", "tap keyboard.q", "delay 10", "release modifier.left_control"]

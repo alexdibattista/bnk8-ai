@@ -375,12 +375,13 @@ param 0 or the macOS native param. Every other entry is written as
 
 | Byte | Meaning |
 |---|---|
-| 0 | effect id, 0 = off, ≤ 50 (renderer handles ≤ 44); cycle list: 1 3 4 5 12 13 14 15 16 21 24 26 28 34 35 36 38 42 43 44 |
+| 0 | effect id, 0 = off, ≤ 50 (renderer handles ≤ 44); cycle list: 1 3 4 5 12 13 14 15 16 21 24 26 28 34 35 36 38 42 43 44 (Studio's names: solid, gradient_up_down, gradient_left_right, breathing, cycle_all, wave, cycle_up_down, rainbow_chevron, cycle_out_in, rainbow_beacon, raindrops, hue_breathing, hue_wave, reactive_simple, reactive, reactive_wide, reactive_cross, splash, multisplash, solid_splash) |
 | 1 | brightness, ≤ 180 |
 | 2 | speed: animation period = (375 − speed) × 8 ms |
-| 3 | flags (factory `01`; bit 2 checked by `FUN_080007EC`) |
+| 3 | flags (factory `01`): bit 0 effect on (`effect ≠ 0`), bit 1 per-key colours present, bit 2 same lighting on every layer (checked by `FUN_080007EC`), as Studio writes them |
 | 4..6 | colour R, G, B |
-| 7..39 | zero in factory; renderer reads 4-byte groups from 8 `[INFERENCE: per-LED overrides]` |
+| 7 | zero |
+| 8..39 | 8 per-key colour records `[enabled, R, G, B]` for K1..K8, over the effect (Studio) |
 
 ## Persistence
 

@@ -23,11 +23,10 @@ ccw = "keyboard.f7"
 cw = "keyboard.f8"
 
 [layers.lighting]
-effect = 1
+effect = "solid"
 brightness = 80
 speed = 120
 color = "#730000"
-flags = 1
 
 [[layers]]
 keys = [
@@ -47,11 +46,10 @@ ccw = "keyboard.f7"
 cw = "keyboard.f8"
 
 [layers.lighting]
-effect = 1
+effect = "solid"
 brightness = 80
 speed = 120
 color = "#A374F0"
-flags = 1
 
 [[layers]]
 keys = [
@@ -71,11 +69,10 @@ ccw = "keyboard.f7"
 cw = "keyboard.f8"
 
 [layers.lighting]
-effect = 1
+effect = "solid"
 brightness = 80
 speed = 120
 color = "#FF2300"
-flags = 1
 
 [[layers]]
 keys = [
@@ -95,11 +92,10 @@ ccw = "keyboard.f7"
 cw = "keyboard.f8"
 
 [layers.lighting]
-effect = 1
+effect = "solid"
 brightness = 80
 speed = 120
 color = "#A4FF27"
-flags = 1
 
 # omp CLI shortcuts (see omp keybindings: app.approval.approve, Esc, app.stt.pushToTalk).
 [macros]

@@ -95,9 +95,9 @@ enum Set {
     Lighting {
         #[arg(long, default_value_t = 0)]
         layer: usize,
-        /// Effect id 0..=50 (0 = off).
+        /// Effect name (solid, breathing, …) or id 0..=50.
         #[arg(long)]
-        effect: Option<u8>,
+        effect: Option<String>,
         /// 0..=180.
         #[arg(long)]
         brightness: Option<u8>,
@@ -237,10 +237,14 @@ fn set(serial: Option<&str>, what: Set) -> Result<()> {
                 "nothing to set: pass --effect, --brightness, --speed or --color"
             );
             let l = &mut layer_mut(&mut cfg, layer)?.lighting;
-            l.effect = effect.unwrap_or(l.effect);
+            if let Some(e) = effect {
+                l.effect = config::parse_effect(&e)?;
+            }
             l.brightness = brightness.unwrap_or(l.brightness);
             l.speed = speed.unwrap_or(l.speed);
             l.color = color.unwrap_or_else(|| l.color.clone());
+            // Re-derive the flags byte from the new settings.
+            l.flags = None;
         }
     }
     write(&dev, Some(&cur), &cur, &cfg, false)

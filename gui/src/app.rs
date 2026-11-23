@@ -8,8 +8,8 @@ use std::sync::mpsc::{Sender, channel};
 use anyhow::Result;
 use iced::futures::channel::oneshot;
 use iced::widget::{
-    Column, button, center, column, container, mouse_area, opaque, pick_list, row, rule, scrollable, slider, space,
-    stack, text, text_input, tooltip,
+    Column, button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, rule, scrollable, slider,
+    space, stack, text, text_input, tooltip,
 };
 use iced::{Alignment, Color, Element, Fill, Font, Length, Task, Theme};
 
@@ -28,6 +28,8 @@ const KNOB_SIZE: f32 = 116.0;
 /// Bindings and lighting cards; wide enough for a label and both pickers.
 const EDITOR_WIDTH: f32 = 540.0;
 const LABEL_WIDTH: f32 = 140.0;
+/// A key without its own colour in `Lighting::key_colors`.
+const NO_COLOR: &str = "none";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Control {
@@ -151,8 +153,38 @@ pub enum LightingEdit {
     Speed(u8),
     Color(String),
     Channel(usize, u8),
-    Flags(String),
+    Shared(bool),
+    /// Key index 0..8 and its colour text (`#RRGGBB`; empty = none).
+    KeyColor(usize, String),
 }
+
+/// An effect in the effect picker, shown by its name.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct EffectChoice(u8);
+
+impl fmt::Display for EffectChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match config::effect_name(self.0) {
+            Some(name) => {
+                let name = name.replace('_', " ");
+                let mut c = name.chars();
+                let first = c.next().map(|f| f.to_uppercase().to_string()).unwrap_or_default();
+                write!(f, "{first}{}", c.as_str())
+            }
+            None => write!(f, "Effect {}", self.0),
+        }
+    }
+}
+
+const EFFECT_CHOICES: [EffectChoice; config::EFFECTS.len()] = {
+    let mut out = [EffectChoice(0); config::EFFECTS.len()];
+    let mut i = 0;
+    while i < out.len() {
+        out[i] = EffectChoice(config::EFFECTS[i].0);
+        i += 1;
+    }
+    out
+};
 
 #[derive(Clone, Debug)]
 pub enum StepEdit {
@@ -479,7 +511,8 @@ impl App {
                 }
             }
             Message::Lighting(edit) => {
-                let l = &mut self.cfg.layers[self.layer].lighting;
+                let p = self.layer;
+                let l = &mut self.cfg.layers[p].lighting;
                 match edit {
                     LightingEdit::Effect(v) => l.effect = v,
                     LightingEdit::Brightness(v) => l.brightness = v,
@@ -490,11 +523,30 @@ impl App {
                         rgb[i] = v;
                         l.color = hex_rgb(rgb);
                     }
-                    LightingEdit::Flags(s) if s.is_empty() => l.flags = 0,
-                    LightingEdit::Flags(s) => {
-                        if let Ok(v) = s.parse() {
-                            l.flags = v;
+                    LightingEdit::Shared(on) => l.shared = on,
+                    LightingEdit::KeyColor(k, s) => {
+                        // Key colours overwrite the bytes `extra` holds.
+                        l.extra = None;
+                        let colors = l.key_colors.get_or_insert_with(|| vec![NO_COLOR.into(); 8]);
+                        if colors.len() <= k {
+                            colors.resize(k + 1, NO_COLOR.into());
                         }
+                        let s = s.trim();
+                        colors[k] = if s.is_empty() { NO_COLOR.into() } else { s.to_string() };
+                        if colors.iter().all(|c| c == NO_COLOR) {
+                            l.key_colors = None;
+                        }
+                    }
+                }
+                // Studio's flags byte follows from the settings.
+                l.flags = None;
+                // Shared lighting is one setup copied to every layer.
+                let l = l.clone();
+                for layer in &mut self.cfg.layers {
+                    if l.shared {
+                        layer.lighting = l.clone();
+                    } else {
+                        layer.lighting.shared = false;
                     }
                 }
             }
@@ -819,9 +871,18 @@ impl App {
         };
         let badge = (extra > 0).then(|| text(format!("+{extra}")).size(11).style(style::accent));
         match c {
-            Control::Key(_) => {
+            Control::Key(k) => {
+                let key_color = layer.lighting.key_colors.as_ref().and_then(|cs| parse_rgb(cs.get(k)?));
+                let swatch = key_color.map(|[r, g, b]| {
+                    container(space()).width(10).height(10).style(style::swatch(Color::from_rgb8(r, g, b)))
+                });
                 let content = column![
-                    row![text(title).size(12).style(style::muted), space::horizontal()].push(badge),
+                    row![text(title).size(12).style(style::muted)]
+                        .push(swatch)
+                        .push(space::horizontal())
+                        .push(badge)
+                        .spacing(6)
+                        .align_y(Alignment::Center),
                     space::vertical(),
                     main(14, 17.0),
                 ]
@@ -884,8 +945,13 @@ impl App {
         let rgb = parse_rgb(&l.color);
         let [r, g, b] = rgb.unwrap_or([255, 255, 255]);
         let effect = tooltip(
-            slider(0..=config::MAX_EFFECT, l.effect, |v| Message::Lighting(LightingEdit::Effect(v))),
-            tip("0 = off. The action 'RGB effect next' cycles 1 3 4 5 12 13 14 15 16 21 24 26 28 34 35 36 38 42 43 44."),
+            pick_list(&EFFECT_CHOICES[..], Some(EffectChoice(l.effect)), |e| {
+                Message::Lighting(LightingEdit::Effect(e.0))
+            })
+            .width(220)
+            .menu_height(320)
+            .style(style::field),
+            tip("The action 'RGB effect next' cycles through these effects, in this order."),
             tooltip::Position::Top,
         );
         let channel = |i: usize, name: &'static str, v: u8| {
@@ -915,17 +981,29 @@ impl App {
             column![channel(0, "R", r), channel(1, "G", g), channel(2, "B", b)].spacing(6),
         ]
         .spacing(12);
-        let flags = tooltip(
-            text_input("0", &l.flags.to_string())
-                .on_input(|s| Message::Lighting(LightingEdit::Flags(s)))
-                .font(Font::MONOSPACE)
-                .width(70)
-                .style(style::input),
-            tip("Raw flags byte; factory value 1."),
-            tooltip::Position::Top,
-        );
+        let shared = checkbox(l.shared)
+            .label("Same lighting on every layer")
+            .on_toggle(|on| Message::Lighting(LightingEdit::Shared(on)));
+        let key_color = |k: usize| {
+            let value = l.key_colors.as_ref().and_then(|c| c.get(k)).map_or("", String::as_str);
+            column![
+                text(format!("K{}", k + 1)).size(11).style(style::muted),
+                text_input(NO_COLOR, if value == NO_COLOR { "" } else { value })
+                    .on_input(move |s| Message::Lighting(LightingEdit::KeyColor(k, s)))
+                    .font(Font::MONOSPACE)
+                    .size(13)
+                    .width(80)
+                    .style(style::input),
+            ]
+            .spacing(2)
+        };
+        let key_colors = column![
+            row((0..4).map(|k| key_color(k).into())).spacing(8),
+            row((4..8).map(|k| key_color(k).into())).spacing(8),
+        ]
+        .spacing(8);
         let body = column![
-            value_row("Effect", effect, if l.effect == 0 { "off".into() } else { l.effect.to_string() }),
+            field_row("Effect", effect),
             value_row(
                 "Brightness",
                 slider(0..=config::MAX_BRIGHTNESS, l.brightness, |v| Message::Lighting(LightingEdit::Brightness(v))),
@@ -934,9 +1012,12 @@ impl App {
             value_row("Speed", slider(0..=255, l.speed, |v| Message::Lighting(LightingEdit::Speed(v))), l.speed.to_string()),
             field_row("Colour", colour),
             channels,
-            field_row("Flags", flags),
+            field_row("Key colours", key_colors),
+            row![space().width(LABEL_WIDTH), shared].spacing(12),
         ]
-        .push(l.extra.is_some().then(|| hint("This layer has undecoded per-LED data; it is kept as is.")))
+        .push(l.extra.is_some().then(|| {
+            hint("This layer has per-key data bnk8 can't show; editing a key colour replaces it.")
+        }))
         .spacing(12);
         card("Lighting".into(), body)
     }

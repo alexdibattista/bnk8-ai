@@ -183,7 +183,7 @@ pub fn add(cfg: &mut Config, preset: &Preset, lighting: &Lighting) -> Result<usi
     next.layers.push(Layer {
         keys: keys.into_iter().map(Key::from_slots).collect(),
         knob,
-        lighting: Lighting { color: preset.color.into(), ..lighting.clone() },
+        lighting: Lighting { color: preset.color.into(), key_colors: None, extra: None, flags: None, ..lighting.clone() },
     });
     config::to_blob(&next, FACTORY)?;
     *cfg = next;

@@ -37,6 +37,10 @@ const MACRO_STEPS: usize = 7;
 const OFF_LIGHTING: usize = 0x5e7;
 const LIGHTING_LEN: usize = 0x28;
 const LIGHTING_EXTRA: usize = 7;
+/// Per-key colour records `[enabled, R, G, B]` for K1..K8, within a layer's lighting.
+const OFF_KEY_COLORS: usize = 8;
+const KEY_COLORS: usize = 8;
+const FLAG_SHARED: u8 = 4;
 
 /// Keymap offsets of K1..K8 (matrix positions 0, 1, 3..=8; position 2 is the knob).
 const KEY_OFFSETS: [usize; 8] = [0, 4, 14, 18, 22, 26, 30, 34];
@@ -121,18 +125,105 @@ pub struct Slots {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Lighting {
-    /// Effect id 0..=50; 0 = off.
+    /// Effect id 0..=50 (0 = off); written as its [`EFFECTS`] name when it has one.
+    #[serde(with = "effect_serde")]
     pub effect: u8,
     /// 0..=180.
     pub brightness: u8,
     pub speed: u8,
     /// `#RRGGBB`.
     pub color: String,
-    /// Raw flags byte (factory: 1).
-    pub flags: u8,
-    /// Undecoded trailing 33 bytes as hex; omitted when all zero.
+    /// One lighting setup for every layer (flags bit 2); must be the same on every layer.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shared: bool,
+    /// K1..K8 colours over the effect: 8 entries of `#RRGGBB` or `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_colors: Option<Vec<String>>,
+    /// Raw flags byte, only when it differs from the one bnk8 derives
+    /// (bit 0 effect on, bit 1 key colours, bit 2 shared), as Studio writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flags: Option<u8>,
+    /// Bytes 7..40 as hex, when they can't be expressed as `key_colors`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
+/// Lighting effects (byte 0) by id, named as in Binepad Studio; exactly the
+/// firmware's effect cycle list, plus off.
+pub const EFFECTS: &[(u8, &str)] = &[
+    (0, "off"),
+    (1, "solid"),
+    (3, "gradient_up_down"),
+    (4, "gradient_left_right"),
+    (5, "breathing"),
+    (12, "cycle_all"),
+    (13, "wave"),
+    (14, "cycle_up_down"),
+    (15, "rainbow_chevron"),
+    (16, "cycle_out_in"),
+    (21, "rainbow_beacon"),
+    (24, "raindrops"),
+    (26, "hue_breathing"),
+    (28, "hue_wave"),
+    (34, "reactive_simple"),
+    (35, "reactive"),
+    (36, "reactive_wide"),
+    (38, "reactive_cross"),
+    (42, "splash"),
+    (43, "multisplash"),
+    (44, "solid_splash"),
+];
+
+pub fn effect_name(id: u8) -> Option<&'static str> {
+    EFFECTS.iter().find(|(i, _)| *i == id).map(|(_, n)| *n)
+}
+
+fn effect_id(name: &str) -> Option<u8> {
+    EFFECTS.iter().find(|(_, n)| *n == name).map(|(i, _)| *i)
+}
+
+fn unknown_effect(s: &str) -> String {
+    format!("unknown effect `{s}`: use a name (off, solid, breathing, …) or a number 0..={MAX_EFFECT}")
+}
+
+/// An effect name or id 0..=50.
+pub fn parse_effect(s: &str) -> Result<u8> {
+    let id = if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        s.parse::<u8>().ok().filter(|n| *n <= MAX_EFFECT)
+    } else {
+        effect_id(s)
+    };
+    id.with_context(|| unknown_effect(s))
+}
+
+/// `Lighting::effect` in TOML: a name when it has one, else the id.
+mod effect_serde {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(id: &u8, s: S) -> Result<S::Ok, S::Error> {
+        match super::effect_name(*id) {
+            Some(name) => s.serialize_str(name),
+            None => s.serialize_u8(*id),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Id(u8),
+            Name(String),
+        }
+        match Repr::deserialize(d)? {
+            Repr::Id(id) => Ok(id),
+            Repr::Name(s) => super::effect_id(&s).ok_or_else(|| D::Error::custom(super::unknown_effect(&s))),
+        }
+    }
 }
 
 impl Slots {
@@ -233,6 +324,9 @@ pub fn from_blob(b: &Blob) -> Result<Config> {
         Ok(s)
     };
 
+    // Studio sets the shared bit on every layer or none; a mixed blob keeps
+    // per-layer bits in `flags`.
+    let shared = (0..layers).all(|p| b[OFF_LIGHTING + p * LIGHTING_LEN + 3] & FLAG_SHARED != 0);
     let mut out = Vec::with_capacity(layers);
     for p in 0..layers {
         let km = &b[OFF_KEYMAP + p * KEYMAP_LEN..][..KEYMAP_LEN];
@@ -242,19 +336,7 @@ pub fn from_blob(b: &Blob) -> Result<Config> {
             .collect::<Result<_>>()?;
         let knob = slots(&km[KNOB_OFFSET..], &KNOB_SLOTS)?;
         let l = &b[OFF_LIGHTING + p * LIGHTING_LEN..][..LIGHTING_LEN];
-        let extra = &l[LIGHTING_EXTRA..];
-        out.push(Layer {
-            keys,
-            knob,
-            lighting: Lighting {
-                effect: l[0],
-                brightness: l[1],
-                speed: l[2],
-                flags: l[3],
-                color: format!("#{:02X}{:02X}{:02X}", l[4], l[5], l[6]),
-                extra: extra.iter().any(|&x| x != 0).then(|| hex(extra)),
-            },
-        });
+        out.push(Layer { keys, knob, lighting: decode_lighting(l, shared) });
     }
 
     let mut macros = BTreeMap::new();
@@ -349,6 +431,65 @@ fn parse_color(s: &str) -> Option<[u8; 3]> {
     unhex(h)?.try_into().ok()
 }
 
+fn rgb_hex(c: &[u8]) -> String {
+    format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2])
+}
+
+/// The flags byte Studio writes for lighting bytes `l` (byte 3 ignored).
+fn derived_flags(l: &[u8], shared: bool) -> u8 {
+    let keys = l[OFF_KEY_COLORS..].chunks(4).any(|c| c[0] != 0);
+    u8::from(l[0] != 0) | u8::from(keys) << 1 | if shared { FLAG_SHARED } else { 0 }
+}
+
+fn decode_lighting(l: &[u8], shared: bool) -> Lighting {
+    let records = &l[OFF_KEY_COLORS..];
+    let plain = l[LIGHTING_EXTRA] == 0 && records.chunks(4).all(|c| c[0] == 1 || c == [0, 0, 0, 0]);
+    let (key_colors, extra) = if plain {
+        let colors = records.chunks(4).map(|c| if c[0] == 1 { rgb_hex(&c[1..]) } else { NONE.into() });
+        (records.chunks(4).any(|c| c[0] == 1).then(|| colors.collect()), None)
+    } else {
+        (None, Some(hex(&l[LIGHTING_EXTRA..])))
+    };
+    Lighting {
+        effect: l[0],
+        brightness: l[1],
+        speed: l[2],
+        color: rgb_hex(&l[4..7]),
+        shared,
+        key_colors,
+        flags: (l[3] != derived_flags(l, shared)).then_some(l[3]),
+        extra,
+    }
+}
+
+fn encode_lighting(l: &Lighting, path: &str) -> Result<[u8; LIGHTING_LEN]> {
+    ensure!(l.effect <= MAX_EFFECT, "{path}.effect: {} not in 0..={MAX_EFFECT}", l.effect);
+    ensure!(l.brightness <= MAX_BRIGHTNESS, "{path}.brightness: {} not in 0..={MAX_BRIGHTNESS}", l.brightness);
+    let rgb = parse_color(&l.color).with_context(|| format!("{path}.color: `{}` is not #RRGGBB", l.color))?;
+    ensure!(!(l.extra.is_some() && l.key_colors.is_some()), "{path}: set either extra or key_colors, not both");
+    let mut out = [0u8; LIGHTING_LEN];
+    out[..7].copy_from_slice(&[l.effect, l.brightness, l.speed, 0, rgb[0], rgb[1], rgb[2]]);
+    if let Some(x) = &l.extra {
+        let bytes = unhex(x)
+            .filter(|v| v.len() == LIGHTING_LEN - LIGHTING_EXTRA)
+            .with_context(|| format!("{path}.extra: expected {} hex bytes", LIGHTING_LEN - LIGHTING_EXTRA))?;
+        out[LIGHTING_EXTRA..].copy_from_slice(&bytes);
+    }
+    if let Some(colors) = &l.key_colors {
+        ensure!(colors.len() == KEY_COLORS, "{path}.key_colors: expected {KEY_COLORS} entries");
+        for (k, v) in colors.iter().enumerate() {
+            if v == NONE {
+                continue;
+            }
+            let [r, g, b] =
+                parse_color(v).with_context(|| format!("{path}.key_colors[{k}]: `{v}` is not #RRGGBB or none"))?;
+            out[OFF_KEY_COLORS + 4 * k..][..4].copy_from_slice(&[1, r, g, b]);
+        }
+    }
+    out[3] = l.flags.unwrap_or_else(|| derived_flags(&out, l.shared));
+    Ok(out)
+}
+
 /// Encodes `cfg` over `base`, rewriting every modelled region.
 pub fn to_blob(cfg: &Config, base: &Blob) -> Result<Blob> {
     ensure!(cfg.format == FORMAT, "format: {} is not {FORMAT}", cfg.format);
@@ -427,19 +568,13 @@ pub fn to_blob(cfg: &Config, base: &Blob) -> Result<Blob> {
     }
     b[OFF_LIGHTING..OFF_LIGHTING + MAX_LAYERS * LIGHTING_LEN].fill(0);
     for (p, layer) in cfg.layers.iter().enumerate() {
-        let l = &layer.lighting;
         let path = format!("layers[{p}].lighting");
-        ensure!(l.effect <= MAX_EFFECT, "{path}.effect: {} not in 0..={MAX_EFFECT}", l.effect);
-        ensure!(l.brightness <= MAX_BRIGHTNESS, "{path}.brightness: {} not in 0..={MAX_BRIGHTNESS}", l.brightness);
-        let rgb = parse_color(&l.color).with_context(|| format!("{path}.color: `{}` is not #RRGGBB", l.color))?;
-        let out = &mut b[OFF_LIGHTING + p * LIGHTING_LEN..][..LIGHTING_LEN];
-        out[..7].copy_from_slice(&[l.effect, l.brightness, l.speed, l.flags, rgb[0], rgb[1], rgb[2]]);
-        if let Some(x) = &l.extra {
-            let bytes = unhex(x)
-                .filter(|v| v.len() == LIGHTING_LEN - LIGHTING_EXTRA)
-                .with_context(|| format!("{path}.extra: expected {} hex bytes", LIGHTING_LEN - LIGHTING_EXTRA))?;
-            out[LIGHTING_EXTRA..].copy_from_slice(&bytes);
-        }
+        ensure!(
+            layer.lighting.shared == cfg.layers[0].lighting.shared,
+            "{path}.shared: must be the same on every layer"
+        );
+        let l = encode_lighting(&layer.lighting, &path)?;
+        b[OFF_LIGHTING + p * LIGHTING_LEN..][..LIGHTING_LEN].copy_from_slice(&l);
     }
 
     b[OFF_MACROS..OFF_MACROS + MACRO_SLOTS * MACRO_LEN].fill(0);
@@ -499,11 +634,16 @@ pub fn flatten(cfg: &Config) -> Vec<(String, String)> {
         }
         let l = &layer.lighting;
         let lp = format!("layers[{p}].lighting");
-        v.push((format!("{lp}.effect"), l.effect.to_string()));
+        v.push((format!("{lp}.effect"), effect_name(l.effect).map_or_else(|| l.effect.to_string(), str::to_string)));
         v.push((format!("{lp}.brightness"), l.brightness.to_string()));
         v.push((format!("{lp}.speed"), l.speed.to_string()));
         v.push((format!("{lp}.color"), l.color.to_uppercase()));
-        v.push((format!("{lp}.flags"), l.flags.to_string()));
+        v.push((format!("{lp}.shared"), l.shared.to_string()));
+        let key_colors = l.key_colors.as_ref().map(|c| {
+            c.iter().map(|v| if v == NONE { v.clone() } else { v.to_uppercase() }).collect::<Vec<_>>().join(",")
+        });
+        v.push((format!("{lp}.key_colors"), key_colors.unwrap_or_default()));
+        v.push((format!("{lp}.flags"), l.flags.map(|f| f.to_string()).unwrap_or_default()));
         v.push((format!("{lp}.extra"), l.extra.clone().unwrap_or_default()));
     }
     for (slot, steps) in &cfg.macros {
@@ -572,8 +712,9 @@ pub fn from_toml(text: &str) -> Result<Config> {
 }
 
 /// Renames format-1 action names ([`actions::legacy_name`]) in bindings and
-/// macro steps, and shifts canonical `[macros]` keys to 1-based. Other keys
-/// are kept, so [`to_blob`] reports them.
+/// macro steps, shifts canonical `[macros]` keys to 1-based, and re-derives
+/// lighting (`shared`, `key_colors`, `flags`) from format 1's raw bytes.
+/// Other macro keys are kept, so [`to_blob`] reports them.
 fn migrate_v1(cfg: &mut Config) {
     fn rename(v: &mut String) {
         if let Some(new) = actions::legacy_name(v) {
@@ -595,6 +736,15 @@ fn migrate_v1(cfg: &mut Config) {
             }
         }
         rename_slots(&mut layer.knob);
+    }
+    // Format 1 had only a raw `flags` byte and `extra`: re-derive both the way
+    // `from_blob` does now. Invalid lighting is left for `to_blob` to report.
+    let encoded: Result<Vec<_>> = cfg.layers.iter().map(|l| encode_lighting(&l.lighting, "")).collect();
+    if let Ok(encoded) = encoded {
+        let shared = encoded.iter().all(|l| l[3] & FLAG_SHARED != 0);
+        for (layer, l) in cfg.layers.iter_mut().zip(&encoded) {
+            layer.lighting = decode_lighting(l, shared);
+        }
     }
     let macros = std::mem::take(&mut cfg.macros);
     for (slot, mut steps) in macros {
@@ -733,6 +883,7 @@ flags = 1
             .replace("keyboard.dot", "keyboard.period")
             .replace("rgb.effect.prev", "rgb.effect.previous")
             .replace("keyboard.left_ctrl", "modifier.left_control")
+            .replace("flags = 1\n", "")
             .replace("\n0 = ", "\n1 = ");
         let old = from_toml(V1).unwrap();
         let new = from_toml(&v2).unwrap();
@@ -742,5 +893,38 @@ flags = 1
         assert_eq!(to_blob(&old, FACTORY).unwrap(), to_blob(&new, FACTORY).unwrap());
         let e = from_toml(&v2.replace("format = 2", "format = 3")).unwrap_err().to_string();
         assert!(e.contains("format = 3"), "{e}");
+    }
+
+    #[test]
+    fn key_colors_and_shared_lighting() {
+        let mut cfg = from_blob(FACTORY).unwrap();
+        let mut colors = vec![NONE.to_string(); 8];
+        colors[2] = "#112233".into();
+        cfg.layers[0].lighting.key_colors = Some(colors);
+        for l in &mut cfg.layers {
+            l.lighting.shared = true;
+        }
+        let blob = to_blob(&cfg, FACTORY).unwrap();
+        let l0 = &blob[OFF_LIGHTING..][..LIGHTING_LEN];
+        assert_eq!(l0[3], 0x07);
+        assert_eq!(l0[OFF_KEY_COLORS + 2 * 4..][..4], [1, 0x11, 0x22, 0x33]);
+        assert_eq!(from_blob(&blob).unwrap(), cfg);
+
+        cfg.layers[1].lighting.shared = false;
+        let e = to_blob(&cfg, FACTORY).unwrap_err().to_string();
+        assert!(e.contains("layers[1].lighting.shared"), "{e}");
+    }
+
+    #[test]
+    fn effects_by_name_or_number() {
+        let text = to_toml(&from_blob(FACTORY).unwrap()).unwrap();
+        assert!(text.contains("effect = \"solid\""), "{text}");
+        let with = |effect: &str| from_toml(&text.replacen("effect = \"solid\"", &format!("effect = {effect}"), 1));
+        assert_eq!(with("\"breathing\"").unwrap().layers[0].lighting.effect, 5);
+        let seven = with("7").unwrap();
+        assert_eq!(seven.layers[0].lighting.effect, 7);
+        assert!(to_toml(&seven).unwrap().contains("effect = 7\n"));
+        let e = with("\"bogus\"").unwrap_err().to_string();
+        assert!(e.contains("bogus"), "{e}");
     }
 }
