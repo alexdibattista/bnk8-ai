@@ -69,6 +69,42 @@ const KNOB_OFFSET: usize = 8;
 pub const KEY_SLOTS: [&str; 4] = ["tap", "double_tap", "hold", "tap_hold"];
 pub const KNOB_SLOTS: [&str; 6] = ["tap", "double_tap", "hold", "tap_hold", "ccw", "cw"];
 
+// The blob layout, checked at compile time: `from_blob`, `to_blob` and
+// `older_factory` index the blob with these constants, so a layout edit that
+// breaks one of these would otherwise panic at run time or corrupt a region.
+const _: () = {
+    // Regions are ordered and disjoint, and fit the blob.
+    assert!(OFF_HOLD + 2 <= OFF_INNER_CRC && OFF_INNER_CRC + 4 <= OFF_ACTIONS);
+    assert!(OFF_ACTIONS + MAX_ACTIONS * ENTRY_LEN <= OFF_KEYMAP);
+    assert!(OFF_KEYMAP + MAX_LAYERS * KEYMAP_LEN <= OFF_MACROS);
+    assert!(OFF_MACROS + MACRO_SLOTS * MACRO_LEN <= OFF_LIGHTING);
+    assert!(OFF_LIGHTING + MAX_LAYERS * LIGHTING_LEN <= CONFIG_LEN);
+    // Keymap indices are 1-based action numbers in one byte.
+    assert!(MAX_ACTIONS <= u8::MAX as usize);
+    // A macro is a step count byte, then 4-byte steps (`<` leaves room for the count).
+    assert!(MACRO_STEPS * 4 < MACRO_LEN);
+    // Lighting: 7 fixed bytes, then `extra`, whose tail holds exactly one 4-byte
+    // colour record per key (`decode_lighting` relies on whole chunks).
+    assert!(LIGHTING_EXTRA <= OFF_KEY_COLORS);
+    assert!(OFF_KEY_COLORS + KEY_COLORS * 4 == LIGHTING_LEN);
+    assert!(KEY_COLORS == KEY_OFFSETS.len());
+    // Each key's and the knob's slots fit a keymap and do not overlap.
+    let mut i = 0;
+    while i < KEY_OFFSETS.len() {
+        let (a, a_end) = (KEY_OFFSETS[i], KEY_OFFSETS[i] + KEY_SLOTS.len());
+        assert!(a_end <= KEYMAP_LEN);
+        assert!(a_end <= KNOB_OFFSET || KNOB_OFFSET + KNOB_SLOTS.len() <= a);
+        let mut j = i + 1;
+        while j < KEY_OFFSETS.len() {
+            let b = KEY_OFFSETS[j];
+            assert!(a_end <= b || b + KEY_SLOTS.len() <= a);
+            j += 1;
+        }
+        i += 1;
+    }
+    assert!(KNOB_OFFSET + KNOB_SLOTS.len() <= KEYMAP_LEN);
+};
+
 pub const MAX_EFFECT: u8 = 50;
 pub const MAX_BRIGHTNESS: u8 = 180;
 const NONE: &str = "none";
