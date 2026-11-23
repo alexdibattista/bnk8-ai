@@ -53,17 +53,19 @@ const OFF_KEYMAP: usize = 0x2b8;
 const KEYMAP_LEN: usize = 0x26;
 const OFF_MACROS: usize = 0x434;
 const MACRO_LEN: usize = 0x1d;
-const MACRO_STEPS: usize = 7;
+/// Steps one macro holds.
+pub const MACRO_STEPS: usize = 7;
 const OFF_LIGHTING: usize = 0x5e7;
 const LIGHTING_LEN: usize = 0x28;
 const LIGHTING_EXTRA: usize = 7;
+/// Keys K1..K8: each has a keymap entry and a colour record.
+pub const KEYS: usize = 8;
 /// Per-key colour records `[enabled, R, G, B]` for K1..K8, within a layer's lighting.
 const OFF_KEY_COLORS: usize = 8;
-const KEY_COLORS: usize = 8;
 const FLAG_SHARED: u8 = 4;
 
 /// Keymap offsets of K1..K8 (matrix positions 0, 1, 3..=8; position 2 is the knob).
-const KEY_OFFSETS: [usize; 8] = [0, 4, 14, 18, 22, 26, 30, 34];
+const KEY_OFFSETS: [usize; KEYS] = [0, 4, 14, 18, 22, 26, 30, 34];
 const KNOB_OFFSET: usize = 8;
 /// Key slots: tap, double tap, hold, tap-then-hold. The knob adds ccw, cw.
 pub const KEY_SLOTS: [&str; 4] = ["tap", "double_tap", "hold", "tap_hold"];
@@ -86,8 +88,7 @@ const _: () = {
     // Lighting: 7 fixed bytes, then `extra`, whose tail holds exactly one 4-byte
     // colour record per key (`decode_lighting` relies on whole chunks).
     assert!(LIGHTING_EXTRA <= OFF_KEY_COLORS);
-    assert!(OFF_KEY_COLORS + KEY_COLORS * 4 == LIGHTING_LEN);
-    assert!(KEY_COLORS == KEY_OFFSETS.len());
+    assert!(OFF_KEY_COLORS + KEYS * 4 == LIGHTING_LEN);
     // Each key's and the knob's slots fit a keymap and do not overlap.
     let mut i = 0;
     while i < KEY_OFFSETS.len() {
@@ -472,12 +473,14 @@ fn encode_steps(steps: &[String]) -> Result<Vec<[u8; 4]>> {
     Ok(out)
 }
 
-fn parse_color(s: &str) -> Option<[u8; 3]> {
+/// Parses `#RRGGBB`.
+pub fn parse_color(s: &str) -> Option<[u8; 3]> {
     let h = s.strip_prefix('#').filter(|h| h.len() == 6)?;
     actions::unhex(h)?.try_into().ok()
 }
 
-fn rgb_hex(c: &[u8]) -> String {
+/// Formats the first three bytes of `c` as `#RRGGBB`.
+pub fn rgb_hex(c: &[u8]) -> String {
     format!("#{:02X}{:02X}{:02X}", c[0], c[1], c[2])
 }
 
@@ -522,7 +525,7 @@ fn encode_lighting(l: &Lighting, path: &str) -> Result<[u8; LIGHTING_LEN]> {
         out[LIGHTING_EXTRA..].copy_from_slice(&bytes);
     }
     if let Some(colors) = &l.key_colors {
-        ensure!(colors.len() == KEY_COLORS, "{path}.key_colors: expected {KEY_COLORS} entries");
+        ensure!(colors.len() == KEYS, "{path}.key_colors: expected {KEYS} entries");
         for (k, v) in colors.iter().enumerate() {
             if v == NONE {
                 continue;
@@ -549,7 +552,7 @@ pub fn to_blob(cfg: &Config, base: &Blob) -> Result<Blob> {
     // Resolve every binding to an action first, so the table can be built.
     let mut keymaps = Vec::with_capacity(n_layers);
     for (p, layer) in cfg.layers.iter().enumerate() {
-        ensure!(layer.keys.len() == 8, "layers[{p}].keys: {} keys, expected 8", layer.keys.len());
+        ensure!(layer.keys.len() == KEYS, "layers[{p}].keys: {} keys, expected {KEYS}", layer.keys.len());
         let mut km: Vec<(usize, Option<Action>)> = Vec::new();
         for (k, key) in layer.keys.iter().enumerate() {
             let s = key.slots();

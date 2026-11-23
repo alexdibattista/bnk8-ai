@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::mpsc::{Sender, channel};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use iced::futures::channel::oneshot;
 use iced::widget::{
     Column, button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, rule, scrollable, slider,
@@ -19,10 +19,9 @@ use bnk8::store::{self, Current, Source};
 use bnk8::{actions, transport};
 
 use crate::style::{self, BOLD, SEMIBOLD, Tone};
-use crate::widgets::{Catalog, action_picker, key_picker, macro_summary, short, tip};
+use crate::widgets::{Catalog, action_picker, key_picker, macro_summary, pretty, short, tip};
 
 const SLOT_LABELS: [&str; 6] = ["Tap", "Double tap", "Hold", "Tap then hold", "Turn left", "Turn right"];
-const MAX_MACRO_STEPS: usize = 7;
 const KEY_SIZE: (f32, f32) = (136.0, 116.0);
 const KNOB_SIZE: f32 = 116.0;
 /// Bindings and lighting cards; wide enough for a label and both pickers.
@@ -70,7 +69,7 @@ struct Connected {
 /// What reading the device found.
 #[derive(Clone, Debug)]
 pub enum Read {
-    Known { blob: Box<Blob>, source: String, layer_names: Vec<Option<String>> },
+    Known { blob: Box<Blob>, cfg: Config, source: String, layer_names: Vec<Option<String>> },
     Unknown { crc: u32 },
 }
 
@@ -167,12 +166,7 @@ struct EffectChoice(u8);
 impl fmt::Display for EffectChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match config::effect_name(self.0) {
-            Some(name) => {
-                let name = name.replace('_', " ");
-                let mut c = name.chars();
-                let first = c.next().map(|f| f.to_uppercase().to_string()).unwrap_or_default();
-                write!(f, "{first}{}", c.as_str())
-            }
+            Some(name) => f.write_str(&pretty(name)),
             None => write!(f, "Effect {}", self.0),
         }
     }
@@ -338,17 +332,16 @@ impl App {
         self.spawn("Reading device", move || {
             let dev = transport::open(serial.as_deref())?;
             let read = match store::current(&dev)? {
-                Current::Known(blob, Source::Factory) => {
-                    Read::Known { blob, source: "factory default".into(), layer_names: Vec::new() }
-                }
-                Current::Known(blob, Source::OlderFactory(version)) => {
-                    Read::Known { blob, source: format!("factory default (firmware {version})"), layer_names: Vec::new() }
-                }
-                Current::Known(blob, Source::Snapshot) => {
-                    Read::Known { blob, source: "last written by bnk8".into(), layer_names: Vec::new() }
-                }
-                Current::Known(blob, Source::ProfileStore { layer_names }) => {
-                    Read::Known { blob, source: "saved by Binepad Studio".into(), layer_names }
+                Current::Known(blob, source) => {
+                    // Decoded here, so a config bnk8 can't model is an error, not a panic.
+                    let cfg = config::from_blob(&blob).context("decoding the device's config")?;
+                    let (source, layer_names) = match source {
+                        Source::Factory => ("factory default".into(), Vec::new()),
+                        Source::OlderFactory(version) => (format!("factory default (firmware {version})"), Vec::new()),
+                        Source::Snapshot => ("last written by bnk8".into(), Vec::new()),
+                        Source::ProfileStore { layer_names } => ("saved by Binepad Studio".into(), layer_names),
+                    };
+                    Read::Known { blob, cfg, source, layer_names }
                 }
                 Current::Unknown { crc } => Read::Unknown { crc },
             };
@@ -384,10 +377,10 @@ impl App {
                 }
             }
             Ok(Done::Loaded { serial, read }) => {
-                let (blob, source, layer_names) = match read {
-                    Read::Known { blob, source, layer_names } => {
+                let (blob, cfg, source, layer_names) = match read {
+                    Read::Known { blob, cfg, source, layer_names } => {
                         self.info(format!("Loaded {serial} ({source})"));
-                        (Some(blob), source, layer_names)
+                        (Some(blob), cfg, source, layer_names)
                     }
                     Read::Unknown { crc } => {
                         self.error(format!(
@@ -395,11 +388,12 @@ impl App {
                              the factory config, or the copy Studio stores on the device. Editing starts from the \
                              factory defaults; Apply writes the whole config."
                         ));
-                        (None, "unknown".into(), Vec::new())
+                        let cfg = config::from_blob(FACTORY).expect("factory config decodes");
+                        (None, cfg, "unknown".into(), Vec::new())
                     }
                 };
-                self.cfg = config::from_blob(blob.as_deref().unwrap_or(FACTORY)).expect("verified blob decodes");
-                self.layer = self.layer.min(self.cfg.layers.len() - 1);
+                self.cfg = cfg;
+                self.clamp_layer();
                 self.layer_names = layer_names.clone();
                 self.connected = Some(Connected { serial, config: blob, source, layer_names });
             }
@@ -430,7 +424,7 @@ impl App {
 
     /// `Layer N`, plus Binepad Studio's name for it when known.
     fn layer_title(&self, i: usize) -> String {
-        match self.layer_names.get(i).cloned().flatten() {
+        match self.layer_names.get(i).and_then(Option::as_deref) {
             Some(name) => format!("Layer {i} · {name}"),
             None => format!("Layer {i}"),
         }
@@ -488,14 +482,14 @@ impl App {
             Message::Load if idle && self.serial.is_some() => return self.load(),
             Message::DismissBanner => self.message = None,
             Message::SelectTab(tab) => self.tab = tab,
-            Message::SelectLayer(i) => {
+            Message::SelectLayer(i) if i < self.cfg.layers.len() => {
                 self.layer = i;
                 self.tab = Tab::Keys;
             }
             Message::AddLayer if self.cfg.layers.len() < actions::MAX_LAYERS => {
                 let knob = Slots { hold: Some("layer.next".into()), ..Slots::default() };
                 let lighting = self.cfg.layers[self.layer].lighting.clone();
-                self.cfg.layers.push(Layer { keys: vec![Key::Tap("none".into()); 8], knob, lighting });
+                self.cfg.layers.push(Layer { keys: vec![Key::Tap("none".into()); config::KEYS], knob, lighting });
                 self.layer_names.push(None);
                 self.layer = self.cfg.layers.len() - 1;
             }
@@ -550,15 +544,15 @@ impl App {
                     LightingEdit::Speed(v) => l.speed = v,
                     LightingEdit::Color(c) => l.color = c,
                     LightingEdit::Channel(i, v) => {
-                        let mut rgb = parse_rgb(&l.color).unwrap_or([255, 255, 255]);
+                        let mut rgb = config::parse_color(&l.color).unwrap_or([255, 255, 255]);
                         rgb[i] = v;
-                        l.color = hex_rgb(rgb);
+                        l.color = config::rgb_hex(&rgb);
                     }
                     LightingEdit::Shared(on) => l.shared = on,
                     LightingEdit::KeyColor(k, s) => {
                         // Key colours overwrite the bytes `extra` holds.
                         l.extra = None;
-                        let colors = l.key_colors.get_or_insert_with(|| vec![NO_COLOR.into(); 8]);
+                        let colors = l.key_colors.get_or_insert_with(|| vec![NO_COLOR.into(); config::KEYS]);
                         if colors.len() <= k {
                             colors.resize(k + 1, NO_COLOR.into());
                         }
@@ -615,7 +609,7 @@ impl App {
                 }
             }),
             Message::AddKeyStep => self.edit_macro(|steps| {
-                if key_steps(steps) < MAX_MACRO_STEPS {
+                if key_steps(steps) < config::MACRO_STEPS {
                     steps.push("tap keyboard.a".into());
                 }
             }),
@@ -660,6 +654,7 @@ impl App {
             // Stale clicks on controls that are disabled now, and cancelled dialogs.
             Message::RefreshDevices
             | Message::Load
+            | Message::SelectLayer(_)
             | Message::AddLayer
             | Message::RemoveLayer
             | Message::Apply
@@ -683,7 +678,7 @@ impl App {
 
     fn import(&mut self, path: PathBuf) {
         let result = std::fs::read_to_string(&path)
-            .map_err(anyhow::Error::from)
+            .context("reading")
             .and_then(|t| config::from_toml(&t))
             .and_then(|c| config::to_blob(&c, FACTORY).map(|_| c));
         match result {
@@ -698,7 +693,7 @@ impl App {
     }
 
     fn export(&mut self, path: PathBuf) {
-        match config::to_toml(&self.cfg).and_then(|t| Ok(std::fs::write(&path, t)?)) {
+        match config::to_toml(&self.cfg).and_then(|t| std::fs::write(&path, t).context("writing")) {
             Ok(()) => self.info(format!("Exported {}", path.display())),
             Err(e) => self.error(format!("{}: {e:#}", path.display())),
         }
@@ -905,7 +900,7 @@ impl App {
         let badge = (extra > 0).then(|| text(format!("+{extra}")).size(11).style(style::accent));
         match c {
             Control::Key(k) => {
-                let key_color = layer.lighting.key_colors.as_ref().and_then(|cs| parse_rgb(cs.get(k)?));
+                let key_color = layer.lighting.key_colors.as_ref().and_then(|cs| config::parse_color(cs.get(k)?));
                 let swatch = key_color.map(|[r, g, b]| {
                     container(space()).width(10).height(10).style(style::swatch(Color::from_rgb8(r, g, b)))
                 });
@@ -975,7 +970,7 @@ impl App {
 
     fn lighting_editor(&self) -> Element<'_, Message> {
         let l = &self.cfg.layers[self.layer].lighting;
-        let rgb = parse_rgb(&l.color);
+        let rgb = config::parse_color(&l.color);
         let [r, g, b] = rgb.unwrap_or([255, 255, 255]);
         let effect = tooltip(
             pick_list(&EFFECT_CHOICES[..], Some(EffectChoice(l.effect)), |e| {
@@ -1031,8 +1026,8 @@ impl App {
             .spacing(2)
         };
         let key_colors = column![
-            row((0..4).map(|k| key_color(k).into())).spacing(8),
-            row((4..8).map(|k| key_color(k).into())).spacing(8),
+            row((0..config::KEYS / 2).map(|k| key_color(k).into())).spacing(8),
+            row((config::KEYS / 2..config::KEYS).map(|k| key_color(k).into())).spacing(8),
         ]
         .spacing(8);
         let body = column![
@@ -1142,14 +1137,14 @@ impl App {
         let actions = row![
             button(text("+ Key step").size(13))
                 .style(style::ghost)
-                .on_press_maybe((key_steps(steps) < MAX_MACRO_STEPS).then_some(Message::AddKeyStep)),
+                .on_press_maybe((key_steps(steps) < config::MACRO_STEPS).then_some(Message::AddKeyStep)),
             button(text("+ Delay").size(13)).style(style::ghost).on_press(Message::AddDelay),
             space::horizontal(),
             button(text("Clear").size(13)).style(style::ghost_danger).on_press_maybe((n > 0).then_some(Message::ClearSteps)),
         ]
         .spacing(8);
         card(
-            format!("Macro {m}"),
+            format!("Macro {}", m + 1),
             column![list, actions, hint("A delay (multiple of 10 ms, up to 2550 ms) waits before the next key step.")]
                 .spacing(14),
         )
@@ -1378,18 +1373,8 @@ fn renumber_slots(slots: &mut Slots, names: &[&str], removed: usize) -> (bool, u
     (changed, cleared)
 }
 
-fn parse_rgb(s: &str) -> Option<[u8; 3]> {
-    let h = s.strip_prefix('#').filter(|h| h.len() == 6)?;
-    let v = |i: usize| u8::from_str_radix(h.get(i..i + 2)?, 16).ok();
-    Some([v(0)?, v(2)?, v(4)?])
-}
-
-fn hex_rgb([r, g, b]: [u8; 3]) -> String {
-    format!("#{r:02X}{g:02X}{b:02X}")
-}
-
 fn layer_color(layer: &Layer) -> Color {
-    let [r, g, b] = parse_rgb(&layer.lighting.color).unwrap_or([0, 0, 0]);
+    let [r, g, b] = config::parse_color(&layer.lighting.color).unwrap_or([0, 0, 0]);
     if layer.lighting.effect == 0 { Color::from_rgb8(40, 42, 50) } else { Color::from_rgb8(r, g, b) }
 }
 
@@ -1400,7 +1385,7 @@ mod tests {
     #[test]
     fn removing_a_layer_renumbers_layer_bindings() {
         let mut base = config::from_blob(FACTORY).unwrap().layers.remove(0);
-        base.keys = vec![Key::Tap("none".into()); 8];
+        base.keys = vec![Key::Tap("none".into()); config::KEYS];
         base.knob = Slots::default();
         let mut cfg = config::from_blob(FACTORY).unwrap();
         cfg.layers = vec![base.clone(), base.clone(), base];

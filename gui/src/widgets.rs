@@ -12,7 +12,7 @@ use crate::style;
 const RAW_ZERO: &str = "raw.00000000000000";
 const PICKER_WIDTH: u32 = 200;
 
-/// Declaration order must match [`Category::ALL`]: it indexes [`Catalog`]'s groups.
+/// Declaration order matches [`Category::ALL`] (checked below): it indexes [`Catalog`]'s groups.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Category {
     None,
@@ -86,6 +86,15 @@ impl Category {
         }
     }
 }
+
+// `Catalog::group` indexes by `Category as usize`.
+const _: () = {
+    let mut i = 0;
+    while i < Category::ALL.len() {
+        assert!(Category::ALL[i] as usize == i);
+        i += 1;
+    }
+};
 
 impl fmt::Display for Category {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -248,7 +257,8 @@ fn key_label(name: &str) -> String {
     }
 }
 
-fn pretty(s: &str) -> String {
+/// `snake_case` as a capitalised phrase: `volume_up` -> `Volume up`.
+pub fn pretty(s: &str) -> String {
     let s = s.replace('_', " ");
     let mut c = s.chars();
     match c.next() {
