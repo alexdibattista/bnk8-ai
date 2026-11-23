@@ -456,7 +456,9 @@ config (`[LIVE]`: factory blob CRC `0xCA2BFF5F` = token B before and
 after the factory write). bnk8 stores every blob it writes at
 `$XDG_STATE_HOME/bnk8/<serial>.bin` (default `~/.local/state/bnk8/`).
 `dump`, `set` and the `apply` diff use that snapshot, the embedded
-factory blob, or the profile store's copy — each only when its CRC
+factory blob, the factory configs of firmware 6.0.19/21/24 (the same
+blob with other layer colours, recognised by CRC), or the profile
+store's copy — each only when its CRC
 equals token B, i.e. it is provably the device's config. A config that
 matches none of them is reported as unknown; `apply` then writes the
 whole file over the factory base, and `reset` restores the factory

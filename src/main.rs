@@ -386,10 +386,11 @@ fn info(serial: Option<&str>) -> Result<()> {
         Current::Known(blob, source) => {
             let cfg = config::from_blob(&blob)?;
             let (label, names) = match &source {
-                Source::Factory => ("factory default", &[][..]),
-                Source::Snapshot => ("matches the local snapshot", &[][..]),
+                Source::Factory => ("factory default".to_string(), &[][..]),
+                Source::OlderFactory(version) => (format!("factory default of firmware {version}"), &[][..]),
+                Source::Snapshot => ("matches the local snapshot".to_string(), &[][..]),
                 Source::ProfileStore { layer_names } => {
-                    ("read from the device (saved by Binepad Studio)", layer_names.as_slice())
+                    ("read from the device (saved by Binepad Studio)".to_string(), layer_names.as_slice())
                 }
             };
             println!(

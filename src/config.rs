@@ -19,6 +19,26 @@ pub const DEVICE: &str = "binepad.bnk8";
 /// Factory default config, extracted from the published 6.0.27 image.
 pub static FACTORY: &Blob = include_bytes!("../assets/factory-config.bin");
 
+/// Factory configs of older firmware: version, CRC-32, layer colours. They
+/// differ from [`FACTORY`] only in the four layers' colours (6.0.18, which
+/// also lacks the Media bindings, is not derivable and not listed).
+pub const OLDER_FACTORY: &[(&str, u32, [[u8; 3]; 4])] = &[
+    ("6.0.24", 0xEBD4_C372, [[255, 35, 0], [164, 255, 39], [163, 116, 240], [255, 166, 0]]),
+    ("6.0.21", 0x9AC5_2986, [[119, 166, 255], [217, 119, 87], [255, 35, 0], [163, 116, 240]]),
+    ("6.0.19", 0x0FB1_AEA0, [[119, 166, 255], [217, 119, 87], [75, 195, 126], [163, 116, 240]]),
+];
+
+/// [`FACTORY`] with each layer's colour replaced, as older firmware shipped it.
+pub fn older_factory(colors: &[[u8; 3]; 4]) -> Blob {
+    let mut b = *FACTORY;
+    for (p, rgb) in colors.iter().enumerate() {
+        b[OFF_LIGHTING + p * LIGHTING_LEN + 4..][..3].copy_from_slice(rgb);
+    }
+    let inner = crc32(&b[OFF_ACTIONS..]);
+    b[OFF_INNER_CRC..OFF_INNER_CRC + 4].copy_from_slice(&inner.to_le_bytes());
+    b
+}
+
 const MAGIC: [u8; 4] = *b"BPN8";
 const OFF_LAYERS: usize = 5;
 const OFF_POSITIONS: usize = 6;
@@ -766,6 +786,13 @@ fn migrate_v1(cfg: &mut Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_factory_configs_match_their_crcs() {
+        for (version, crc, colors) in OLDER_FACTORY {
+            assert_eq!(crc32(&older_factory(colors)), *crc, "firmware {version}");
+        }
+    }
 
     #[test]
     fn factory_round_trips_byte_for_byte() {

@@ -2,23 +2,26 @@
 //! last config bnk8 wrote, per device serial.
 //!
 //! `0x10` status token B is the CRC-32 of the active config, so any blob
-//! whose CRC equals token B is exactly what the device holds. There are three
-//! candidates, cheapest first (PROTOCOL.md "The read model"): bnk8's local
-//! snapshot, the factory config, and the copy of the native config in the
-//! device's profile store, which Binepad Studio writes when it saves.
+//! whose CRC equals token B is exactly what the device holds. The candidates,
+//! cheapest first (PROTOCOL.md "The read model"): bnk8's local snapshot, the
+//! factory config (of the current or an older firmware), and the copy of the
+//! native config in the device's profile store, which Binepad Studio writes
+//! when it saves.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use crate::archive;
-use crate::config::{Blob, FACTORY};
+use crate::config::{Blob, FACTORY, OLDER_FACTORY, older_factory};
 use crate::protocol::{CONFIG_LEN, Nak, PHASE_IDLE, crc32};
 use crate::transport::Bnk8;
 
 pub enum Source {
     Snapshot,
     Factory,
+    /// The factory config of an older firmware version.
+    OlderFactory(&'static str),
     /// Read back from the device's profile store (last saved by Binepad Studio),
     /// with Studio's layer names from its archive, one entry per layer.
     ProfileStore { layer_names: Vec<Option<String>> },
@@ -54,6 +57,9 @@ pub fn current(dev: &Bnk8) -> Result<Current> {
     }
     if crc32(FACTORY) == crc {
         return Ok(Current::Known(Box::new(*FACTORY), Source::Factory));
+    }
+    if let Some((version, _, colors)) = OLDER_FACTORY.iter().find(|(_, c, _)| *c == crc) {
+        return Ok(Current::Known(Box::new(older_factory(colors)), Source::OlderFactory(version)));
     }
     // Firmware without the profile store NAKs the status request.
     let stream = match dev.stream_status() {

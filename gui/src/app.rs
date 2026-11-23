@@ -62,7 +62,7 @@ struct Connected {
     /// The device's config, when bnk8 can prove it (CRC match with the
     /// snapshot, the factory config or the profile store's copy).
     config: Option<Box<Blob>>,
-    source: &'static str,
+    source: String,
     /// Binepad Studio's layer names, when the config was read from its profile store.
     layer_names: Vec<Option<String>>,
 }
@@ -70,7 +70,7 @@ struct Connected {
 /// What reading the device found.
 #[derive(Clone, Debug)]
 pub enum Read {
-    Known { blob: Box<Blob>, source: &'static str, layer_names: Vec<Option<String>> },
+    Known { blob: Box<Blob>, source: String, layer_names: Vec<Option<String>> },
     Unknown { crc: u32 },
 }
 
@@ -339,13 +339,16 @@ impl App {
             let dev = transport::open(serial.as_deref())?;
             let read = match store::current(&dev)? {
                 Current::Known(blob, Source::Factory) => {
-                    Read::Known { blob, source: "factory default", layer_names: Vec::new() }
+                    Read::Known { blob, source: "factory default".into(), layer_names: Vec::new() }
+                }
+                Current::Known(blob, Source::OlderFactory(version)) => {
+                    Read::Known { blob, source: format!("factory default (firmware {version})"), layer_names: Vec::new() }
                 }
                 Current::Known(blob, Source::Snapshot) => {
-                    Read::Known { blob, source: "last written by bnk8", layer_names: Vec::new() }
+                    Read::Known { blob, source: "last written by bnk8".into(), layer_names: Vec::new() }
                 }
                 Current::Known(blob, Source::ProfileStore { layer_names }) => {
-                    Read::Known { blob, source: "saved by Binepad Studio", layer_names }
+                    Read::Known { blob, source: "saved by Binepad Studio".into(), layer_names }
                 }
                 Current::Unknown { crc } => Read::Unknown { crc },
             };
@@ -392,7 +395,7 @@ impl App {
                              the factory config, or the copy Studio stores on the device. Editing starts from the \
                              factory defaults; Apply writes the whole config."
                         ));
-                        (None, "unknown", Vec::new())
+                        (None, "unknown".into(), Vec::new())
                     }
                 };
                 self.cfg = config::from_blob(blob.as_deref().unwrap_or(FACTORY)).expect("verified blob decodes");
@@ -412,7 +415,7 @@ impl App {
                 self.layer_names.clear();
                 if let Some(c) = &mut self.connected {
                     c.config = Some(blob);
-                    c.source = "last written by bnk8";
+                    c.source = "last written by bnk8".into();
                     c.layer_names.clear();
                 }
                 self.info(format!("Saved {changes} change(s) to the device"));
