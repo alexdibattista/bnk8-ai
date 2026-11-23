@@ -385,17 +385,25 @@ fn info(serial: Option<&str>) -> Result<()> {
     match store::current(&dev)? {
         Current::Known(blob, source) => {
             let cfg = config::from_blob(&blob)?;
-            let source = match source {
-                Source::Factory => "factory default",
-                Source::Snapshot => "matches the local snapshot",
-                Source::ProfileStore => "read from the device (saved by Binepad Studio)",
+            let (label, names) = match &source {
+                Source::Factory => ("factory default", &[][..]),
+                Source::Snapshot => ("matches the local snapshot", &[][..]),
+                Source::ProfileStore { layer_names } => {
+                    ("read from the device (saved by Binepad Studio)", layer_names.as_slice())
+                }
             };
             println!(
-                "  config:    {source}, CRC {:#010x}, {} layers, {} macros",
+                "  config:    {label}, CRC {:#010x}, {} layers, {} macros",
                 protocol::crc32(&*blob),
                 cfg.layers.len(),
                 cfg.macros.len()
             );
+            // Studio's names live in its archive, not the config, so `dump` can't carry them.
+            let named: Vec<String> =
+                names.iter().enumerate().filter_map(|(i, n)| Some(format!("{i} {}", n.as_ref()?))).collect();
+            if !named.is_empty() {
+                println!("  layers:    {}", named.join(", "));
+            }
         }
         Current::Unknown { crc } => {
             println!("  config:    unknown to bnk8 (CRC {crc:#010x}); dump/set need `reset` or `apply` first")

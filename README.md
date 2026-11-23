@@ -152,7 +152,7 @@ Keep a `layer.next` binding (factory: knob press) on every layer so you can alwa
 
 ## How reading the config works
 
-The device reports a CRC-32 of its active config, and bnk8 trusts a config only when its CRC matches. It looks in three places: the file it saves after every write (`~/.local/state/bnk8/<serial>.bin`, or `$XDG_STATE_HOME/bnk8/`), the built-in factory config, and the copy Binepad Studio keeps on the device when it saves.
+The device reports a CRC-32 of its active config, and bnk8 trusts a config only when its CRC matches. It looks in three places: the file it saves after every write (`~/.local/state/bnk8/<serial>.bin`, or `$XDG_STATE_HOME/bnk8/`), the built-in factory config, and the copy Binepad Studio keeps on the device when it saves. With Studio's copy, `bnk8 info` and the app also show Studio's layer names; they aren't part of the config, so the TOML doesn't carry them.
 
 If none of them matches (for example, another tool wrote the config), it shows as **unknown**: editing starts from the factory defaults, and applying writes the whole config. Every write replaces all 2000 bytes; the per-item changes shown are for your review.
 

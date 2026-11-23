@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::archive;
 use crate::config::{Blob, FACTORY};
 use crate::protocol::{CONFIG_LEN, Nak, PHASE_IDLE, crc32};
 use crate::transport::Bnk8;
@@ -18,8 +19,9 @@ use crate::transport::Bnk8;
 pub enum Source {
     Snapshot,
     Factory,
-    /// Read back from the device's profile store (last saved by Binepad Studio).
-    ProfileStore,
+    /// Read back from the device's profile store (last saved by Binepad Studio),
+    /// with Studio's layer names from its archive, one entry per layer.
+    ProfileStore { layer_names: Vec<Option<String>> },
 }
 
 /// The device's current config, if bnk8 can identify it.
@@ -60,11 +62,22 @@ pub fn current(dev: &Bnk8) -> Result<Current> {
         Err(e) => return Err(e),
     };
     if stream.phase == PHASE_IDLE && stream.revision != 0 && stream.native_len as usize == CONFIG_LEN {
-        let bytes = dev.profile_store_read(stream.revision, CONFIG_LEN)?;
-        let blob = Blob::try_from(bytes.as_slice()).unwrap();
+        let payload = dev.profile_store_read(stream.revision, CONFIG_LEN + stream.archive_len as usize)?;
+        let blob = Blob::try_from(&payload[..CONFIG_LEN]).unwrap();
         if crc32(&blob) == crc {
+            // Token B already proves the native config; names are best effort.
+            let mut layer_names = vec![None; blob[5] as usize]; // byte 5: layer count
+            if crc32(&payload) == stream.payload_crc
+                && let Ok(found) = archive::layer_names(&payload[CONFIG_LEN..])
+            {
+                for (i, name) in found {
+                    if let Some(slot) = layer_names.get_mut(i) {
+                        *slot = Some(name);
+                    }
+                }
+            }
             // Not saved as a snapshot: the snapshot records bnk8's own writes.
-            return Ok(Current::Known(Box::new(blob), Source::ProfileStore));
+            return Ok(Current::Known(Box::new(blob), Source::ProfileStore { layer_names }));
         }
     }
     Ok(Current::Unknown { crc })

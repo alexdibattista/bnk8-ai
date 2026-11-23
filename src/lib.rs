@@ -2,6 +2,7 @@
 //! Shared by the `bnk8` CLI and the `bnk8-gui` configurator.
 
 pub mod actions;
+pub mod archive;
 pub mod config;
 pub mod frame;
 pub mod protocol;

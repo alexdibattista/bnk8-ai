@@ -63,12 +63,14 @@ struct Connected {
     /// snapshot, the factory config or the profile store's copy).
     config: Option<Box<Blob>>,
     source: &'static str,
+    /// Binepad Studio's layer names, when the config was read from its profile store.
+    layer_names: Vec<Option<String>>,
 }
 
 /// What reading the device found.
 #[derive(Clone, Debug)]
 pub enum Read {
-    Known(Box<Blob>, &'static str),
+    Known { blob: Box<Blob>, source: &'static str, layer_names: Vec<Option<String>> },
     Unknown { crc: u32 },
 }
 
@@ -240,6 +242,8 @@ pub struct App {
     control: Control,
     tab: Tab,
     macro_slot: usize,
+    /// Binepad Studio's names of the edited layers, by index; empty when unknown.
+    layer_names: Vec<Option<String>>,
     preview: Preview,
     preview_of: Option<Config>,
     /// Label of the running device job, if any.
@@ -273,6 +277,7 @@ impl App {
             control: Control::Key(0),
             tab: Tab::Keys,
             macro_slot: 0,
+            layer_names: Vec::new(),
             preview: Preview::Invalid(String::new()),
             preview_of: None,
             busy: None,
@@ -333,9 +338,15 @@ impl App {
         self.spawn("Reading device", move || {
             let dev = transport::open(serial.as_deref())?;
             let read = match store::current(&dev)? {
-                Current::Known(blob, Source::Factory) => Read::Known(blob, "factory default"),
-                Current::Known(blob, Source::Snapshot) => Read::Known(blob, "last written by bnk8"),
-                Current::Known(blob, Source::ProfileStore) => Read::Known(blob, "saved by Binepad Studio"),
+                Current::Known(blob, Source::Factory) => {
+                    Read::Known { blob, source: "factory default", layer_names: Vec::new() }
+                }
+                Current::Known(blob, Source::Snapshot) => {
+                    Read::Known { blob, source: "last written by bnk8", layer_names: Vec::new() }
+                }
+                Current::Known(blob, Source::ProfileStore { layer_names }) => {
+                    Read::Known { blob, source: "saved by Binepad Studio", layer_names }
+                }
                 Current::Unknown { crc } => Read::Unknown { crc },
             };
             Ok(Done::Loaded { serial: dev.serial().to_string(), read })
@@ -370,10 +381,10 @@ impl App {
                 }
             }
             Ok(Done::Loaded { serial, read }) => {
-                let (blob, source) = match read {
-                    Read::Known(blob, source) => {
+                let (blob, source, layer_names) = match read {
+                    Read::Known { blob, source, layer_names } => {
                         self.info(format!("Loaded {serial} ({source})"));
-                        (Some(blob), source)
+                        (Some(blob), source, layer_names)
                     }
                     Read::Unknown { crc } => {
                         self.error(format!(
@@ -381,12 +392,13 @@ impl App {
                              the factory config, or the copy Studio stores on the device. Editing starts from the \
                              factory defaults; Apply writes the whole config."
                         ));
-                        (None, "unknown")
+                        (None, "unknown", Vec::new())
                     }
                 };
                 self.cfg = config::from_blob(blob.as_deref().unwrap_or(FACTORY)).expect("verified blob decodes");
                 self.layer = self.layer.min(self.cfg.layers.len() - 1);
-                self.connected = Some(Connected { serial, config: blob, source });
+                self.layer_names = layer_names.clone();
+                self.connected = Some(Connected { serial, config: blob, source, layer_names });
             }
             Ok(Done::Written { blob, changes, edits }) => {
                 // The written blob is the new diff base. Edits made while it was
@@ -396,9 +408,12 @@ impl App {
                     self.cfg = config::from_blob(&blob).expect("written blob decodes");
                     self.clamp_layer();
                 }
+                // Studio's stored copy, and with it its layer names, no longer matches the device.
+                self.layer_names.clear();
                 if let Some(c) = &mut self.connected {
                     c.config = Some(blob);
                     c.source = "last written by bnk8";
+                    c.layer_names.clear();
                 }
                 self.info(format!("Saved {changes} change(s) to the device"));
             }
@@ -408,6 +423,14 @@ impl App {
 
     fn base(&self) -> &Blob {
         self.connected.as_ref().and_then(|c| c.config.as_deref()).unwrap_or(FACTORY)
+    }
+
+    /// `Layer N`, plus Binepad Studio's name for it when known.
+    fn layer_title(&self, i: usize) -> String {
+        match self.layer_names.get(i).cloned().flatten() {
+            Some(name) => format!("Layer {i} · {name}"),
+            None => format!("Layer {i}"),
+        }
     }
 
     /// The connected device, when it is also the one selected in the device
@@ -470,12 +493,14 @@ impl App {
                 let knob = Slots { hold: Some("layer.next".into()), ..Slots::default() };
                 let lighting = self.cfg.layers[self.layer].lighting.clone();
                 self.cfg.layers.push(Layer { keys: vec![Key::Tap("none".into()); 8], knob, lighting });
+                self.layer_names.push(None);
                 self.layer = self.cfg.layers.len() - 1;
             }
             Message::AddPreset(preset) => {
                 let lighting = self.cfg.layers[self.layer].lighting.clone();
                 match presets::add(&mut self.cfg, preset, &lighting) {
                     Ok(i) => {
+                        self.layer_names.push(None);
                         self.layer = i;
                         self.tab = Tab::Keys;
                         self.control = Control::Key(0);
@@ -489,6 +514,9 @@ impl App {
             Message::RemoveLayer if self.cfg.layers.len() > 1 => {
                 let removed = self.layer;
                 self.cfg.layers.remove(removed);
+                if removed < self.layer_names.len() {
+                    self.layer_names.remove(removed);
+                }
                 let cleared = renumber_layer_refs(&mut self.cfg, removed);
                 self.clamp_layer();
                 if cleared > 0 {
@@ -601,6 +629,7 @@ impl App {
             }
             Message::Discard if idle => {
                 self.cfg = config::from_blob(self.base()).expect("base decodes");
+                self.layer_names = self.connected.as_ref().map_or_else(Vec::new, |c| c.layer_names.clone());
                 self.clamp_layer();
             }
             Message::Import => {
@@ -657,6 +686,7 @@ impl App {
         match result {
             Ok(c) => {
                 self.cfg = c;
+                self.layer_names.clear();
                 self.clamp_layer();
                 self.info(format!("Imported {} (not yet applied)", path.display()));
             }
@@ -747,7 +777,7 @@ impl App {
         let layers = self.cfg.layers.iter().enumerate().map(|(i, layer)| {
             let content = row![
                 container(space()).width(12).height(12).style(style::swatch(layer_color(layer))),
-                text(format!("Layer {i}")).size(14),
+                text(self.layer_title(i)).size(14),
             ]
             .spacing(10)
             .align_y(Alignment::Center);
@@ -802,7 +832,7 @@ impl App {
     fn keys_tab(&self) -> Element<'_, Message> {
         let l = self.layer;
         column![
-            page_title(format!("Layer {l}"), "Pick a key or the knob, then choose what each gesture does."),
+            page_title(self.layer_title(l), "Pick a key or the knob, then choose what each gesture does."),
             // Wraps the editors below the keypad when the window is too narrow for both.
             row![
                 column![
