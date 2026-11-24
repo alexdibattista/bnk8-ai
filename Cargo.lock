@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "bnk8"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "brotli",
@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "bnk8-gui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "bnk8",
