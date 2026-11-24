@@ -49,6 +49,10 @@ gh secret set APPLE_API_ISSUER --body <ISSUER-ID>
 
 Then delete the exported `.p12`, and keep the `.p8` somewhere safe, such as a password manager.
 
+**Current setup (2026-11-24):** identity `Developer ID Application: V&A Labs inc (D763F5MGGM)` (certificate `PP2PV557YA`, expires 2027-12-24), notarization key `9887GJC4JS` ("bnk8 notary", Developer role), local notarytool profile `bnk8-notary`, and all five GitHub secrets set. When the certificate expires, create a new one from a new CSR and replace `MACOS_CERTIFICATE_P12` and `MACOS_CERTIFICATE_PASSWORD`.
+
+**Dry run:** to check signing and notarization without releasing, run the workflow by hand: **Actions → Release (macOS) → Run workflow** on `main`, or `gh workflow run release-macos.yml --ref main`. It builds, signs and notarizes the version in `Cargo.toml` and keeps the files as the run's `macos-release` artifact for 7 days; it creates no tag or release.
+
 ## Each release
 
 1. Pick the version, e.g. `0.2.0`, and set it in three places:
@@ -85,7 +89,7 @@ You need [rustup](https://rustup.rs) with both targets. Homebrew's `rust` builds
 ```sh
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-SIGN_IDENTITY="Developer ID Application: Alexander Di Battista (TEAMID)" \
+SIGN_IDENTITY="Developer ID Application: V&A Labs inc (D763F5MGGM)" \
 NOTARY_PROFILE=bnk8-notary \
 scripts/release-macos.sh 0.2.0
 

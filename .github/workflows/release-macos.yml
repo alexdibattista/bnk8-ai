@@ -1,5 +1,8 @@
 # Builds, signs and notarizes the macOS release when a version tag is pushed,
 # then attaches it to a draft GitHub Release for review. See RELEASING.md.
+# Run it by hand (workflow_dispatch) for a dry run: it builds, signs and
+# notarizes the version in Cargo.toml and keeps the files as a run artifact,
+# without creating a release.
 #
 # The signing job (build) can only read the repo; the job that can write
 # releases (release) never sees signing material, only the built files.
@@ -9,6 +12,7 @@ name: Release (macOS)
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions: {}
 
@@ -90,7 +94,13 @@ jobs:
         env:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        run: scripts/release-macos.sh "${GITHUB_REF_NAME#v}"
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version=${GITHUB_REF_NAME#v}
+          else
+            version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          fi
+          scripts/release-macos.sh "$version"
 
       - name: Remove signing material
         if: always()
@@ -107,6 +117,7 @@ jobs:
 
   release:
     needs: build
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
