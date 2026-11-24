@@ -31,21 +31,61 @@ const GESTURES: [&str; 6] = ["Tap", "DoubleTap", "Hold", "TapHold", "RotateCount
 const MACRO_EVENTS: [(&str, &str); 3] = [("tap", "Tap"), ("press", "KeyDown"), ("release", "KeyUp")];
 const NONE: &str = "none";
 
-/// Studio action references for actions bnk8 can only name as `raw.*`
-/// (actions with arguments, desktop macros, ids bnk8 doesn't know), keyed by
-/// that raw name. Taken from the previous profile, so they survive an edit.
+/// Where a binding sits: layer, control (K1..K8 = 0..8, knob = [`KNOB_CONTROL`]), gesture slot.
+type Position = (usize, usize, usize);
+const KNOB_CONTROL: usize = KEYS;
+
+/// Studio action references bnk8 can't regenerate from the native config
+/// (actions with arguments, desktop macros, ids bnk8 doesn't know), by the
+/// binding position they came from, with the native action name they compile
+/// to. Taken from the previous profile, so they survive an edit. Keyed by
+/// position because several bindings can share one native entry while their
+/// Studio arguments differ (two `app.open` keys naming different apps).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Aliases {
-    refs: BTreeMap<String, Value>,
+    at: BTreeMap<Position, (String, Value)>,
 }
 
 impl Aliases {
     /// The Studio action ids, for ordering the action table.
     pub fn ids(&self) -> StudioIds {
-        self.refs
-            .iter()
-            .filter_map(|(name, r)| Some((name.clone(), r["actionId"].as_str()?.to_string())))
-            .collect()
+        let mut ids = StudioIds::new();
+        for (name, r) in self.at.values() {
+            if let Some(id) = r["actionId"].as_str() {
+                ids.entry(name.clone()).or_insert_with(|| id.to_string());
+            }
+        }
+        ids
+    }
+
+    /// The Studio reference to write for `name` at `pos`: the one recorded
+    /// there, or, for a `raw.*` binding moved or copied elsewhere, the only
+    /// reference recorded for that name. Errors when that name stands for
+    /// several different references, since bnk8 can't tell which is meant.
+    fn get(&self, pos: Position, name: &str) -> Result<Option<&Value>> {
+        if let Some((n, r)) = self.at.get(&pos)
+            && n == name
+        {
+            return Ok(Some(r));
+        }
+        if !name.starts_with("raw.") {
+            return Ok(None);
+        }
+        let mut refs: Vec<&Value> = Vec::new();
+        for (_, r) in self.at.values().filter(|(n, _)| n == name) {
+            if !refs.contains(&r) {
+                refs.push(r);
+            }
+        }
+        match refs.as_slice() {
+            [] => Ok(None),
+            [r] => Ok(Some(r)),
+            many => bail!(
+                "`{name}` stands for {} different Binepad Studio actions on this keypad, so bnk8 can't tell \
+                 which one this binding means; move it in Binepad Studio instead",
+                many.len()
+            ),
+        }
     }
 }
 
@@ -147,7 +187,7 @@ pub fn from_profile(p: &Value, native: &Blob) -> Result<(Config, Aliases)> {
                             actions::encode(&name)?.id == fnv1a(&id.to_lowercase()),
                             "layer {i} {control} {gesture}: the device's config holds `{name}`, not Studio's `{id}`"
                         );
-                        aliases.refs.insert(name.clone(), r.clone());
+                        aliases.at.insert((i, key.unwrap_or(KNOB_CONTROL), s), (name.clone(), r.clone()));
                         name
                     }
                 };
@@ -163,7 +203,8 @@ pub fn from_profile(p: &Value, native: &Blob) -> Result<(Config, Aliases)> {
         }
         let source = if shared { layer0 } else { l };
         let lighting = lighting_from(&source["lighting"], shared).with_context(|| format!("layer {i} lighting"))?;
-        let name = l["name"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+        // Not plain text (too long, control characters): read as unnamed, so a write keeps it untouched.
+        let name = l["name"].as_str().filter(|s| config::plain_layer_name(s)).map(str::to_string);
         out[i] = Some(Layer { name, keys: keys.into_iter().map(Key::from_slots).collect(), knob, lighting });
     }
 
@@ -269,13 +310,15 @@ fn check_representable(cfg: &Config, aliases: &Aliases) -> Result<()> {
                 "{path}: with shared lighting, every layer must have layer 0's lighting"
             );
         }
-        let keys = layer.keys.iter().enumerate().map(|(k, key)| (format!("layers[{p}].keys[{k}]"), key.slots()));
-        for (at, s) in keys.chain([(format!("layers[{p}].knob"), layer.knob.clone())]) {
+        let keys = layer.keys.iter().enumerate().map(|(k, key)| (k, format!("layers[{p}].keys[{k}]"), key.slots()));
+        let knob = (KNOB_CONTROL, format!("layers[{p}].knob"), layer.knob.clone());
+        for (control, at, s) in keys.chain([knob]) {
             for (i, slot) in KNOB_SLOTS.iter().enumerate() {
                 let Some(name) = s.get(slot).filter(|n| *n != NONE) else { continue };
+                let preserved = aliases.get((p, control, i), name).with_context(|| format!("{at}.{slot}"))?.is_some();
                 if name.starts_with("raw.") {
                     ensure!(
-                        aliases.refs.contains_key(name),
+                        preserved,
                         "{at}.{slot}: `{name}` is not an action Binepad Studio knows, so it can't be saved there"
                     );
                     continue;
@@ -286,8 +329,9 @@ fn check_representable(cfg: &Config, aliases: &Aliases) -> Result<()> {
                     let ok: Vec<&str> = (0..KNOB_SLOTS.len()).filter(|b| allowed & (1 << b) != 0).map(|b| KNOB_SLOTS[b]).collect();
                     bail!("{at}.{slot}: Binepad Studio allows `{name}` only as {}", ok.join(", "));
                 }
+                // A reference preserved at this position carries the application.
                 ensure!(
-                    !NEEDS_APPLICATION.contains(&name.as_str()),
+                    preserved || !NEEDS_APPLICATION.contains(&name.as_str()),
                     "{at}.{slot}: `{name}` needs an application, which only Binepad Studio can set"
                 );
             }
@@ -340,31 +384,25 @@ fn check_knob_selectors(p: usize, layer: &Layer) -> Result<()> {
     Ok(())
 }
 
-fn action_ref(name: &str, aliases: &Aliases) -> Value {
-    aliases.refs.get(name).cloned().unwrap_or_else(|| json!({"actionId": name}))
-}
-
-fn assignments(layer: &Layer, aliases: &Aliases) -> Value {
-    let controls = KEY_IDS[..2]
-        .iter()
-        .zip(layer.keys[..2].iter().map(Key::slots))
-        .chain([(&KNOB_ID, layer.knob.clone())])
-        .chain(KEY_IDS[2..].iter().zip(layer.keys[2..].iter().map(Key::slots)));
+fn assignments(p: usize, layer: &Layer, aliases: &Aliases) -> Result<Value> {
+    let controls = [0, 1, KNOB_CONTROL].into_iter().chain(2..KEYS);
     let mut out = Vec::new();
-    for (control, s) in controls {
-        let gestures: Vec<Value> = KNOB_SLOTS
-            .iter()
-            .zip(GESTURES)
-            .filter_map(|(slot, g)| {
-                let name = s.get(slot).filter(|n| *n != NONE)?;
-                Some(json!({"gesture": g, "action": action_ref(name, aliases)}))
-            })
-            .collect();
+    for control in controls {
+        let (id, s) = match control {
+            KNOB_CONTROL => (KNOB_ID, layer.knob.clone()),
+            k => (KEY_IDS[k], layer.keys[k].slots()),
+        };
+        let mut gestures = Vec::new();
+        for (i, (slot, g)) in KNOB_SLOTS.iter().zip(GESTURES).enumerate() {
+            let Some(name) = s.get(slot).filter(|n| *n != NONE) else { continue };
+            let action = aliases.get((p, control, i), name)?.cloned().unwrap_or_else(|| json!({"actionId": name}));
+            gestures.push(json!({"gesture": g, "action": action}));
+        }
         if !gestures.is_empty() {
-            out.push(json!({"controlId": control, "gestures": gestures}));
+            out.push(json!({"controlId": id, "gestures": gestures}));
         }
     }
-    Value::Array(out)
+    Ok(Value::Array(out))
 }
 
 fn lighting_json(index: usize, l: &Lighting, prev: Option<&Value>) -> Result<Value> {
@@ -430,7 +468,7 @@ pub fn to_profile(cfg: &Config, prev: &Value, aliases: &Aliases, now: &str) -> R
         let lighting = lighting_json(i, &l.lighting, m.get("lighting"))?;
         m.insert("index".into(), json!(i));
         m.insert("name".into(), json!(name));
-        m.insert("assignments".into(), assignments(l, aliases));
+        m.insert("assignments".into(), assignments(i, l, aliases)?);
         m.insert("lighting".into(), lighting);
         layers.push(Value::Object(m));
     }
@@ -536,14 +574,46 @@ mod tests {
         // An agent action with arguments: bnk8 only knows its native entry.
         let r = json!({"actionId": "app.open", "arguments": {"path": "/Applications/Notes.app"}});
         let raw = format!("raw.{:08x}0000{:02x}", fnv1a("app.open").swap_bytes(), 1);
-        let aliases = Aliases { refs: BTreeMap::from([(raw.clone(), r.clone())]) };
+        let aliases = Aliases { at: BTreeMap::from([((3, 0, 0), (raw.clone(), r.clone()))]) };
         let mut cfg = factory();
-        cfg.layers[3].keys[0] = Key::Tap(raw);
+        cfg.layers[3].keys[0] = Key::Tap(raw.clone());
         let p = to_profile(&cfg, &prev(), &aliases, "t").unwrap();
         assert_eq!(p["layers"][3]["assignments"][0]["gestures"][0]["action"], r);
         let (back, back_aliases) = from_profile(&p, &blob(&cfg, &aliases)).unwrap();
         assert_eq!(back_aliases, aliases);
         assert_eq!(blob(&back, &back_aliases), blob(&cfg, &aliases));
+        // Moved to another key, the only reference for that action goes with it.
+        cfg.layers[3].keys[0] = Key::Tap(NONE.into());
+        cfg.layers[3].keys[5] = Key::Tap(raw);
+        let p = to_profile(&cfg, &prev(), &aliases, "t").unwrap();
+        let moved = p["layers"][3]["assignments"].as_array().unwrap().iter().find(|a| a["controlId"] == KEY_IDS[5]);
+        assert_eq!(moved.unwrap()["gestures"][0]["action"], r);
+    }
+
+    /// Two keys sharing one native entry but naming different apps keep their
+    /// own Studio arguments across an unrelated edit.
+    #[test]
+    fn bindings_sharing_a_native_action_keep_their_own_arguments() {
+        let notes = json!({"actionId": "app.open", "arguments": {"path": "/Applications/Notes.app"}});
+        let mail = json!({"actionId": "app.open", "arguments": {"path": "/Applications/Mail.app"}});
+        let raw = format!("raw.{:08x}0000{:02x}", fnv1a("app.open").swap_bytes(), 1);
+        let mut cfg = factory();
+        cfg.layers[3].keys[0] = Key::Tap(raw.clone());
+        cfg.layers[3].keys[1] = Key::Tap(raw.clone());
+        let aliases = Aliases {
+            at: BTreeMap::from([((3, 0, 0), (raw.clone(), notes.clone())), ((3, 1, 0), (raw.clone(), mail.clone()))]),
+        };
+        // The device's profile, as Studio saved it, and bnk8's reading of it.
+        let saved = to_profile(&cfg, &prev(), &aliases, "t").unwrap();
+        let (mut edit, read) = from_profile(&saved, &blob(&cfg, &aliases)).unwrap();
+        edit.layers[0].lighting.brightness = 10;
+        let p = to_profile(&edit, &saved, &read, "t").unwrap();
+        let action = |k: usize| p["layers"][3]["assignments"][k]["gestures"][0]["action"].clone();
+        assert_eq!((action(0), action(1)), (notes, mail));
+        // A copy elsewhere is ambiguous: refused rather than guessed.
+        edit.layers[3].keys[5] = Key::Tap(raw);
+        let e = format!("{:#}", to_profile(&edit, &saved, &read, "t").unwrap_err());
+        assert!(e.contains("2 different Binepad Studio actions"), "{e}");
     }
 
     #[test]

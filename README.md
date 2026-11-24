@@ -132,7 +132,7 @@ double_tap_ms = 260
 hold_ms = 350
 
 [[layers]]                     # up to 10 layers
-name = "Media"                 # optional; kept on keypads Binepad Studio has saved to
+name = "Media"                 # optional, up to 64 characters; kept on keypads Binepad Studio has saved to
 keys = [
     "keyboard.arrow_up",       # K1 tap only
     "keyboard.arrow_down",     # K2

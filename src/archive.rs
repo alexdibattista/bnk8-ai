@@ -90,7 +90,8 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The named layers of a profile as `(index, name)`.
+/// The named layers of a profile as `(index, name)`; names that aren't
+/// [`plain_layer_name`](crate::config::plain_layer_name)s are skipped.
 pub fn layer_names(profile: &Value) -> Vec<(usize, String)> {
     profile["layers"]
         .as_array()
@@ -98,7 +99,7 @@ pub fn layer_names(profile: &Value) -> Vec<(usize, String)> {
         .flatten()
         .filter_map(|l| {
             let index = usize::try_from(l["index"].as_u64()?).ok()?;
-            let name = l["name"].as_str().filter(|n| !n.is_empty())?;
+            let name = l["name"].as_str().filter(|n| crate::config::plain_layer_name(n))?;
             Some((index, name.to_string()))
         })
         .collect()

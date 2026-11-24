@@ -1,6 +1,6 @@
 //! HID access to the BNK8 AI Edition config channel (interface 1).
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use hidapi::{DeviceInfo, HidApi, HidDevice};
 
 use crate::frame::REPORT_LEN;
@@ -31,6 +31,22 @@ pub fn find(api: &HidApi) -> Vec<DeviceInfo> {
         .collect()
 }
 
+/// A USB serial number bnk8 accepts. The serial comes from the attached
+/// device, names its snapshot file and is printed, so it must be a single
+/// path component of plain ASCII: letters, digits, `-` and `_`.
+pub fn valid_serial(s: &str) -> bool {
+    (1..=126).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// A device-reported serial for display: escaped unless [`valid_serial`].
+pub fn display_serial(s: Option<&str>) -> String {
+    match s {
+        Some(s) if valid_serial(s) => s.to_string(),
+        Some(s) => format!("{s:?}"),
+        None => "<no serial>".into(),
+    }
+}
+
 pub fn open(serial: Option<&str>) -> Result<Bnk8> {
     let api = HidApi::new().context("initialising hidapi")?;
     let mut found = find(&api);
@@ -41,22 +57,25 @@ pub fn open(serial: Option<&str>) -> Result<Bnk8> {
         [] => return Err(not_found(serial)),
         [one] => one,
         many => {
-            let serials: Vec<&str> = many
-                .iter()
-                .map(|d| d.serial_number().unwrap_or("<no serial>"))
-                .collect();
+            let serials: Vec<String> = many.iter().map(|d| display_serial(d.serial_number())).collect();
             bail!(
                 "multiple BNK8 devices; pass --serial (found: {})",
                 serials.join(", ")
             );
         }
     };
+    let serial = info.serial_number().unwrap_or_default();
+    ensure!(
+        valid_serial(serial),
+        "the BNK8 reports an unusable USB serial number {}; bnk8 accepts only letters, digits, `-` and `_`",
+        display_serial(info.serial_number())
+    );
     let dev = info
         .open_device(&api)
         .with_context(|| format!("opening {}", info.path().to_string_lossy()))?;
     Ok(Bnk8 {
         dev,
-        serial: info.serial_number().unwrap_or_default().to_owned(),
+        serial: serial.to_owned(),
         fw: info.release_number(),
         seq: std::cell::Cell::new(0),
     })
@@ -117,11 +136,20 @@ impl Bnk8 {
 
 #[cfg(test)]
 mod tests {
-    use super::format_fw;
+    use super::{display_serial, format_fw, valid_serial};
 
     #[test]
     fn fw_bcd() {
         assert_eq!(format_fw(0x0600), "6.0.0");
         assert_eq!(format_fw(0x1234), "12.3.4");
+    }
+
+    #[test]
+    fn serials_must_be_one_plain_path_component() {
+        assert!(valid_serial("520048000300004C4D4C315600000000"));
+        for bad in ["", "../escape", "/etc/x", "a.b", "a b", "\u{1b}[31mX", &"A".repeat(127)] {
+            assert!(!valid_serial(bad), "{bad:?}");
+        }
+        assert_eq!(display_serial(Some("\u{1b}[31mX")), "\"\\u{1b}[31mX\"");
     }
 }

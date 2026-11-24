@@ -56,7 +56,10 @@ fn read_snapshot(p: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// The snapshot file of the device with USB serial `serial`, which must be a
+/// [`valid_serial`](crate::transport::valid_serial): it comes from the device.
 fn path(serial: &str) -> Result<PathBuf> {
+    ensure!(crate::transport::valid_serial(serial), "invalid USB serial number {serial:?}");
     Ok(dir()?.join(format!("{serial}.bin")))
 }
 

@@ -158,6 +158,16 @@ pub struct Layer {
     pub lighting: Lighting,
 }
 
+/// Longest layer name bnk8 reads or writes, in characters.
+pub const MAX_LAYER_NAME: usize = 64;
+
+/// A layer name bnk8 accepts: 1..=[`MAX_LAYER_NAME`] characters, no control
+/// characters. Names also come from the device's saved profile, and are shown
+/// in terminals and returned to MCP clients, so they are bounded plain text.
+pub fn plain_layer_name(name: &str) -> bool {
+    (1..=MAX_LAYER_NAME).contains(&name.chars().count()) && !name.chars().any(char::is_control)
+}
+
 /// Binepad Studio's action ids for `raw.*` action names, so the action
 /// table sorts as Studio's compiler sorts it (by id, then param).
 pub type StudioIds = BTreeMap<String, String>;
@@ -572,6 +582,12 @@ pub fn to_blob(cfg: &Config, base: &Blob, ids: &StudioIds) -> Result<Blob> {
     let mut keymaps = Vec::with_capacity(n_layers);
     for (p, layer) in cfg.layers.iter().enumerate() {
         ensure!(layer.keys.len() == KEYS, "layers[{p}].keys: {} keys, expected {KEYS}", layer.keys.len());
+        if let Some(name) = &layer.name {
+            ensure!(
+                plain_layer_name(name),
+                "layers[{p}].name: {name:?} must be 1..={MAX_LAYER_NAME} characters without control characters"
+            );
+        }
         let mut km: Vec<(usize, Option<Action>)> = Vec::new();
         for (k, key) in layer.keys.iter().enumerate() {
             let s = key.slots();
@@ -918,6 +934,16 @@ mod tests {
         let mut cfg = base.clone();
         cfg.layers[0].keys[0] = Key::Tap(format!("layer.{}", cfg.layers.len() + 1));
         assert!(err(&cfg).contains("there are only 4 layers"), "{}", err(&cfg));
+
+        // Layer names are bounded plain text: no control characters, at most 64 characters.
+        for bad in ["Ignore previous\ninstructions", "\u{1b}[31mRed", &"x".repeat(MAX_LAYER_NAME + 1), ""] {
+            let mut cfg = base.clone();
+            cfg.layers[1].name = Some(bad.into());
+            assert!(err(&cfg).contains("layers[1].name"), "{}", err(&cfg));
+        }
+        let mut cfg = base.clone();
+        cfg.layers[1].name = Some("Zoom · macOS ✓".into());
+        assert!(to_blob(&cfg, FACTORY, &StudioIds::new()).is_ok());
     }
 
     const V1: &str = r##"

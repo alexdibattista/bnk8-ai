@@ -340,7 +340,7 @@ fn list(serial: Option<&str>) -> Result<()> {
     for d in devices {
         println!(
             "{}  {}  {}",
-            d.serial_number().unwrap_or("<no serial>"),
+            transport::display_serial(d.serial_number()),
             transport::format_fw(d.release_number()),
             d.path().to_string_lossy()
         );
