@@ -27,7 +27,7 @@ Since v0.3.1, releases are signed with a Developer ID (V&A Labs inc) and notariz
 
 | Release | Macs | Signed |
 |---|---|---|
-| [v0.3.1](https://github.com/alexdibattista/bnk8-ai/releases/tag/v0.3.1) (latest) | Apple Silicon and Intel | Yes, notarized |
+| [v0.3.2](https://github.com/alexdibattista/bnk8-ai/releases/tag/v0.3.2) (latest), [v0.3.1](https://github.com/alexdibattista/bnk8-ai/releases/tag/v0.3.1) | Apple Silicon and Intel | Yes, notarized |
 | [v0.3.0](https://github.com/alexdibattista/bnk8-ai/releases/tag/v0.3.0), [v0.2.0](https://github.com/alexdibattista/bnk8-ai/releases/tag/v0.2.0) | Apple Silicon only | No |
 | [v0.1.0](https://github.com/alexdibattista/bnk8-ai/releases/tag/v0.1.0) | Apple Silicon and Intel | No |
 
