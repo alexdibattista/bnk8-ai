@@ -18,12 +18,20 @@ It programs key bindings, knob gestures, macros, lighting and timing directly ov
 
 ## Download (macOS)
 
-Get the latest build from [Releases](https://github.com/alexdibattista/bnk8-ai/releases). Builds run on Apple Silicon and Intel Macs with macOS 11 or newer.
+Get the latest build from [Releases](https://github.com/alexdibattista/bnk8-ai/releases). All builds need macOS 11 or newer.
 
-- **App:** open `BNK8-Configurator-<version>-macos-universal.dmg` and drag **BNK8 Configurator** to Applications.
-- **CLI:** extract `bnk8-<version>-macos-universal.tar.gz` and move `bnk8` somewhere on your `PATH`, e.g. `/usr/local/bin`.
+| Release | Macs | App | CLI |
+|---|---|---|---|
+| [v0.3.0](https://github.com/alexdibattista/bnk8-ai/releases/tag/v0.3.0) (latest) | Apple Silicon only | `BNK8-Configurator-0.3.0-macos-aarch64-unsigned.dmg` | `bnk8-0.3.0-macos-aarch64-unsigned.tar.gz` |
+| [v0.2.0](https://github.com/alexdibattista/bnk8-ai/releases/tag/v0.2.0) | Apple Silicon only | `BNK8-Configurator-0.2.0-macos-aarch64-unsigned.dmg` | `bnk8-0.2.0-macos-aarch64-unsigned.tar.gz` |
+| [v0.1.0](https://github.com/alexdibattista/bnk8-ai/releases/tag/v0.1.0) | Apple Silicon and Intel | `BNK8-Configurator-0.1.0-macos-universal-unsigned.dmg` | `bnk8-0.1.0-macos-universal-unsigned.tar.gz` |
 
-Releases marked **unsigned** are pre-releases whose file names end in `-unsigned`, e.g. `BNK8-Configurator-<version>-macos-universal-unsigned.dmg`. They aren't notarized by Apple, so macOS blocks them the first time you open them. After the "could not verify" warning, go to **System Settings → Privacy & Security** and click **Open Anyway**. Or clear the download flag in Terminal:
+On an Intel Mac, use v0.1.0 until a universal build of a later release is published.
+
+- **App:** open the `.dmg` and drag **BNK8 Configurator** to Applications.
+- **CLI:** extract the `.tar.gz` and move `bnk8` somewhere on your `PATH`, e.g. `/usr/local/bin`.
+
+All releases so far are **unsigned** pre-releases: their file names end in `-unsigned`, and they aren't notarized by Apple, so macOS blocks them the first time you open them. After the "could not verify" warning, go to **System Settings → Privacy & Security** and click **Open Anyway**. Or clear the download flag in Terminal:
 
 ```sh
 xattr -dr com.apple.quarantine "/Applications/BNK8 Configurator.app"
