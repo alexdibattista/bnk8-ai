@@ -6,6 +6,8 @@
 #
 # The signing job (build) can only read the repo; the job that can write
 # releases (release) never sees signing material, only the built files.
+# The signing secrets exist only in the `release` environment, which needs a
+# maintainer's approval for every run and accepts only `main` and `v*` tags.
 # Actions are pinned to commit SHAs; the comment names the tag/branch.
 name: Release (macOS)
 
@@ -19,6 +21,7 @@ permissions: {}
 jobs:
   build:
     runs-on: macos-15
+    environment: release
     timeout-minutes: 60
     permissions:
       contents: read
@@ -36,7 +39,7 @@ jobs:
             if [ -z "${!name:-}" ]; then missing="$missing $name"; fi
           done
           if [ -n "$missing" ]; then
-            echo "::error::Missing repository secrets:$missing. Set them as described in RELEASING.md, \"One-time setup\"."
+            echo "::error::Missing signing secrets:$missing. Set them in the release environment as described in RELEASING.md, \"One-time setup\"."
             exit 1
           fi
 

@@ -37,21 +37,31 @@ Only the Apple Developer team's **Account Holder** can create one, and only on t
      --key AuthKey_<KEYID>.p8 --key-id <KEYID> --issuer <ISSUER-ID>
    ```
 
-### 3. GitHub secrets
+### 3. The `release` environment and its secrets
+
+The signing secrets live only in a GitHub environment named `release`, which the workflow's signing job uses. Every run waits for a required reviewer to approve it, and only `main` and `v*` tags may use the environment, so nobody can sign or notarize from an unreviewed branch. (Required reviewers need a public repository, or GitHub Pro or Team for a private one.)
 
 ```sh
-base64 -i DeveloperID.p12 | gh secret set MACOS_CERTIFICATE_P12
-gh secret set MACOS_CERTIFICATE_PASSWORD          # prompts for the .p12 password
-gh secret set APPLE_API_KEY_P8 < AuthKey_<KEYID>.p8
-gh secret set APPLE_API_KEY_ID --body <KEYID>
-gh secret set APPLE_API_ISSUER --body <ISSUER-ID>
+# Create the environment with yourself as required reviewer, limited to main and v* tags.
+gh api -X PUT repos/<OWNER>/<REPO>/environments/release --input - <<EOF
+{"reviewers": [{"type": "User", "id": $(gh api user -q .id)}],
+ "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+EOF
+gh api -X POST repos/<OWNER>/<REPO>/environments/release/deployment-branch-policies -f name='v*' -f type=tag
+gh api -X POST repos/<OWNER>/<REPO>/environments/release/deployment-branch-policies -f name=main -f type=branch
+
+base64 -i DeveloperID.p12 | gh secret set MACOS_CERTIFICATE_P12 --env release
+gh secret set MACOS_CERTIFICATE_PASSWORD --env release   # prompts for the .p12 password
+gh secret set APPLE_API_KEY_P8 --env release < AuthKey_<KEYID>.p8
+gh secret set APPLE_API_KEY_ID --env release --body <KEYID>
+gh secret set APPLE_API_ISSUER --env release --body <ISSUER-ID>
 ```
 
-Then delete the exported `.p12`, and keep the `.p8` somewhere safe, such as a password manager.
+Don't also set them as repository secrets: those reach every workflow on every branch. Then delete the exported `.p12`, and keep the `.p8` somewhere safe, such as a password manager.
 
-**Current setup (2026-11-24):** identity `Developer ID Application: V&A Labs inc (D763F5MGGM)` (certificate `PP2PV557YA`, expires 2027-12-24), notarization key `9887GJC4JS` ("bnk8 notary", Developer role), local notarytool profile `bnk8-notary`, and all five GitHub secrets set. When the certificate expires, create a new one from a new CSR and replace `MACOS_CERTIFICATE_P12` and `MACOS_CERTIFICATE_PASSWORD`.
+**Current setup (2026-11-24):** identity `Developer ID Application: V&A Labs inc (D763F5MGGM)` (certificate `PP2PV557YA`, expires 2027-12-24), notarization key `9887GJC4JS` ("bnk8 notary", Developer role), local notarytool profile `bnk8-notary`, and the five secrets in the `release` environment, with @alexdibattista as required reviewer. When the certificate expires, create a new one from a new CSR and replace `MACOS_CERTIFICATE_P12` and `MACOS_CERTIFICATE_PASSWORD`.
 
-**Dry run:** to check signing and notarization without releasing, run the workflow by hand: **Actions → Release (macOS) → Run workflow** on `main`, or `gh workflow run release-macos.yml --ref main`. It builds, signs and notarizes the version in `Cargo.toml` and keeps the files as the run's `macos-release` artifact for 7 days; it creates no tag or release.
+**Dry run:** to check signing and notarization without releasing, run the workflow by hand: **Actions → Release (macOS) → Run workflow** on `main`, or `gh workflow run release-macos.yml --ref main`, then approve the `release` environment. It builds, signs and notarizes the version in `Cargo.toml` and keeps the files as the run's `macos-release` artifact for 7 days; it creates no tag or release.
 
 ## Each release
 
@@ -69,7 +79,7 @@ Then delete the exported `.p12`, and keep the `.p8` somewhere safe, such as a pa
    git tag v0.2.0
    git push origin main v0.2.0
    ```
-4. Watch **Actions → Release (macOS)** (about 15 minutes; notarization is usually the slowest step). It fails early if a GitHub secret is missing or the tag and the `Cargo.toml` versions differ, and it refuses to create a release if one for the tag already exists.
+4. In **Actions → Release (macOS)**, open the run and approve the `release` environment under **Review deployments** (or `gh run view <run-id>` shows the pending approval). The signing job starts only then; the run then takes about 15 minutes, notarization usually being the slowest step. It fails early if a secret is missing or the tag and the `Cargo.toml` versions differ, and it refuses to create a release if one for the tag already exists.
 5. Test the draft on a Mac. Download the DMG with a browser, so it gets the quarantine flag users get. Open it, drag the app to Applications and launch it: there must be no "unidentified developer" warning. Run `bnk8 --version` from the tarball.
 6. Edit the generated release notes and press **Publish**.
 
@@ -80,7 +90,7 @@ git tag -d v0.2.0 && git push --delete origin v0.2.0
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-While the repo is private, each run uses about 150 of the 2,000 free monthly Actions minutes, because macOS minutes count 10×. Public repos run free.
+The repository is public, so Actions minutes are free.
 
 ## Releasing from your Mac instead
 
