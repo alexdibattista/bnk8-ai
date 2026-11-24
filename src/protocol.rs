@@ -84,8 +84,21 @@ pub struct DeviceId {
     pub uid: [u8; 12],
 }
 
-/// Stream phase in which the profile store is ready to read or save.
+/// Profile store phases (PROTOCOL.md `0x15`): the store is ready to read or save.
 pub const PHASE_IDLE: u8 = 2;
+/// The store accepts sub-3 data.
+const PHASE_RECEIVE: u8 = 4;
+/// Verify or Confirm failed; sub 4 rescans.
+const PHASE_FAILED: u8 = 8;
+/// The device is applying a newly saved slot.
+const PHASE_ACTIVATING: u8 = 10;
+/// Applying the slot failed; only a power cycle clears it.
+const PHASE_ACTIVATION_FAILED: u8 = 11;
+
+/// Store polling cadence and limits, as Binepad Studio uses them.
+const STORE_POLL: Duration = Duration::from_millis(10);
+const STORE_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const STORE_SAVE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Reply to [`Bnk8::stream_status`] (`0x15` sub 0): the portable profile
 /// store's state (PROTOCOL.md `0x15`, docs/STUDIO.md §5).
@@ -93,16 +106,37 @@ pub const PHASE_IDLE: u8 = 2;
 pub struct StreamStatus {
     /// Store phase, 0..=11; [`PHASE_IDLE`] = ready.
     pub phase: u8,
-    /// Revision of the stored profile; 0 when no valid slot exists.
+    /// Revision of the active slot; 0 when no valid slot exists.
     pub revision: u32,
     /// Length of the stored native config (2000 on the BNK8).
     pub native_len: u16,
-    /// Length of the profile archive stored after the native config.
+    /// Length of the active slot's archive, stored after the native config.
     pub archive_len: u16,
     /// Archive capacity (`0x1810` on the BNK8).
     pub capacity: u16,
-    /// CRC-32 of the stored native config plus archive.
+    /// Bytes received by the save in progress.
+    pub received: u16,
+    /// Archive length of the active slot when idle, of the save's target slot while saving.
+    pub pending_archive_len: u16,
+    /// CRC-32 of native config plus archive; same slot as `pending_archive_len`.
     pub payload_crc: u32,
+}
+
+impl StreamStatus {
+    fn parse(p: &[u8]) -> Result<Self> {
+        ensure!(p.len() == 22 && p[0] == 2, "stream status reply {:02x?} is not a 22-byte status", p);
+        let u16_at = |i: usize| u16::from_le_bytes([p[i], p[i + 1]]);
+        Ok(StreamStatus {
+            phase: p[1],
+            revision: u32::from_le_bytes(p[2..6].try_into().unwrap()),
+            native_len: u16_at(6),
+            archive_len: u16_at(8),
+            capacity: u16_at(10),
+            received: u16_at(12),
+            pending_archive_len: u16_at(14),
+            payload_crc: u32::from_le_bytes(p[16..20].try_into().unwrap()),
+        })
+    }
 }
 
 impl Bnk8 {
@@ -221,16 +255,7 @@ impl Bnk8 {
 
     /// `0x15` sub 0: profile store status.
     pub fn stream_status(&self) -> Result<StreamStatus> {
-        let p = self.stream_status_payload()?;
-        let u16_at = |i: usize| u16::from_le_bytes([p[i], p[i + 1]]);
-        Ok(StreamStatus {
-            phase: p[1],
-            revision: u32::from_le_bytes(p[2..6].try_into().unwrap()),
-            native_len: u16_at(6),
-            archive_len: u16_at(8),
-            capacity: u16_at(10),
-            payload_crc: u32::from_le_bytes(p[16..20].try_into().unwrap()),
-        })
+        StreamStatus::parse(&self.stream_status_payload()?)
     }
 
     /// Raw 22-byte `0x15` sub 0 status block, for reverse engineering.
@@ -241,53 +266,173 @@ impl Bnk8 {
         Ok(p.try_into().unwrap())
     }
 
-    /// `0x15` sub 2: begin a stream write. `token` is the current stream
-    /// token (0 when no valid slot), `size` in 0x30..=0x1810, `crc` the
-    /// CRC-32/ISO-HDLC of the 2000+size data bytes to be transferred.
-    /// Moves the stream state machine 2 -> 3; the device then prepares
-    /// flash and advances to state 4 on its own.
-    pub fn stream_begin(&self, token: u32, size: u16, crc: u32) -> Result<()> {
+    /// `0x15` sub 2: begin saving a new slot. `revision` is the active one (0
+    /// when no valid slot), `archive_len` in 0x30..=0x1810, `crc` the CRC-32 of
+    /// the 2000 + `archive_len` payload bytes. The store goes 2 -> 3 (erase) -> 4.
+    fn store_begin(&self, revision: u32, archive_len: u16, crc: u32) -> Result<StreamStatus> {
         let mut p = [0u8; 11];
         p[0] = 2;
-        p[1..5].copy_from_slice(&token.to_le_bytes());
-        p[5..7].copy_from_slice(&size.to_le_bytes());
+        p[1..5].copy_from_slice(&revision.to_le_bytes());
+        p[5..7].copy_from_slice(&archive_len.to_le_bytes());
         p[7..11].copy_from_slice(&crc.to_le_bytes());
-        self.exchange(MSG_STREAM, &p)?;
-        Ok(())
+        StreamStatus::parse(self.exchange(MSG_STREAM, &p)?.payload())
     }
 
-    /// `0x15` sub 8: declare the next 64-aligned block. `transferred`
-    /// must equal the device's running total; `len` is the block length
-    /// (non-zero, 64-aligned like `transferred`).
-    pub fn stream_seek(&self, transferred: u16, len: u16) -> Result<()> {
-        let mut p = [0u8; 5];
-        p[0] = 8;
-        p[1..3].copy_from_slice(&transferred.to_le_bytes());
-        p[3..5].copy_from_slice(&len.to_le_bytes());
-        self.exchange(MSG_STREAM, &p)?;
-        Ok(())
-    }
-
-    /// `0x15` sub 3: append data to the staging buffer. `seq` must equal
-    /// the device's running total of transferred bytes.
-    pub fn stream_data(&self, seq: u16, data: &[u8]) -> Result<()> {
-        ensure!(data.len() <= 16, "stream chunk {} bytes exceeds 16", data.len());
+    /// `0x15` sub 3: payload bytes at `offset`, which must equal the received
+    /// count; at most 16 bytes, not crossing a 64-byte boundary. NAK 3 while
+    /// the staging buffer is being flushed.
+    fn store_data(&self, offset: u16, data: &[u8]) -> Result<StreamStatus> {
+        ensure!(data.len() <= 16, "store chunk {} bytes exceeds 16", data.len());
         let mut p = [0u8; 19];
         p[0] = 3;
-        p[1..3].copy_from_slice(&seq.to_le_bytes());
+        p[1..3].copy_from_slice(&offset.to_le_bytes());
         p[3..3 + data.len()].copy_from_slice(data);
-        self.exchange(MSG_STREAM, &p[..3 + data.len()])?;
+        StreamStatus::parse(self.exchange(MSG_STREAM, &p[..3 + data.len()])?.payload())
+    }
+
+    /// `0x15` sub 4 with the active `revision`: cancels a save in phases 3..6;
+    /// in 7/8 clears the store's RAM state and rescans flash (never erases).
+    pub fn store_cancel(&self, revision: u32) -> Result<()> {
+        let mut p = [0u8; 5];
+        p[0] = 4;
+        p[1..5].copy_from_slice(&revision.to_le_bytes());
+        self.exchange(MSG_STREAM, &p)?;
         Ok(())
     }
 
-    /// `0x15` sub 4: finish/reset the stream session. From states 3..6
-    /// returns the machine to state 2; from 7/8 performs a full reset.
-    pub fn stream_finish(&self, token: u32) -> Result<()> {
-        let mut p = [0u8; 5];
-        p[0] = 4;
-        p[1..5].copy_from_slice(&token.to_le_bytes());
-        self.exchange(MSG_STREAM, &p)?;
+    /// Waits until the profile store is idle, as Binepad Studio does: one
+    /// sub-4 rescan from Failed, an error on ActivationFailed.
+    pub fn store_wait_idle(&self) -> Result<StreamStatus> {
+        let deadline = Instant::now() + STORE_IDLE_TIMEOUT;
+        let mut rescanned = false;
+        loop {
+            let s = self.stream_status()?;
+            match s.phase {
+                PHASE_IDLE => return Ok(s),
+                PHASE_FAILED if !rescanned => {
+                    rescanned = true;
+                    self.store_cancel(s.revision)?;
+                }
+                PHASE_FAILED => bail!(
+                    "the device's profile store failed and did not recover; unplug the BNK8 and plug it back in"
+                ),
+                PHASE_ACTIVATION_FAILED => bail!(
+                    "the device could not apply its saved profile; unplug the BNK8 and plug it back in"
+                ),
+                _ => {}
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "the device's profile store stayed busy (phase {}) for {STORE_IDLE_TIMEOUT:?}; \
+                 close Binepad Studio and try again",
+                s.phase
+            );
+            std::thread::sleep(STORE_POLL);
+        }
+    }
+
+    /// Saves `payload` (2000-byte native config, then the archive) as the
+    /// profile store's next slot over active `revision`, and waits until the
+    /// device has applied it. Then checks token B and reads the slot back.
+    /// `on_status` sees every store status during the save.
+    pub fn store_save(&self, revision: u32, payload: &[u8], on_status: &mut dyn FnMut(&StreamStatus)) -> Result<()> {
+        let archive_len = payload.len().saturating_sub(CONFIG_LEN);
+        ensure!(
+            (0x30..=STREAM_SIZE_MAX as usize).contains(&archive_len),
+            "profile archive is {archive_len} bytes, expected 48..={STREAM_SIZE_MAX}"
+        );
+        let archive_len = archive_len as u16;
+        let crc = crc32(payload);
+        let idle = self.store_wait_idle()?;
+        ensure!(
+            idle.revision == revision,
+            "the device's profile changed (revision {}, expected {revision}); read it again",
+            idle.revision
+        );
+        if let Err(e) = self.store_transfer(revision, payload, archive_len, crc, on_status) {
+            // Studio's cleanup: cancel our own save if it is still open.
+            if let Ok(s) = self.stream_status()
+                && s.phase != PHASE_IDLE
+                && s.revision == revision
+                && s.pending_archive_len == archive_len
+                && s.payload_crc == crc
+            {
+                let _ = self.store_cancel(revision);
+            }
+            let outcome = match self.store_wait_idle() {
+                Ok(s) if s.revision == revision => "nothing was saved".to_string(),
+                Ok(s) => format!("the device's profile is now revision {}; read it again", s.revision),
+                Err(e) => format!("{e:#}"),
+            };
+            return Err(e.context(format!("saving to the profile store failed: {outcome}")));
+        }
+        let native_crc = crc32(&payload[..CONFIG_LEN]);
+        let token_b = self.status()?.token_b;
+        ensure!(
+            token_b == native_crc,
+            "device reports config CRC {token_b:#010x} after the save, expected {native_crc:#010x}"
+        );
+        let back = self.profile_store_read(revision + 1, payload.len())?;
+        ensure!(back == payload, "the saved profile reads back differently from what was sent");
         Ok(())
+    }
+
+    /// Begins the save, streams the payload and follows the store's phases
+    /// to Idle at `revision + 1` (Studio's `UsbPortableStoreTransfer.WriteAsync`).
+    fn store_transfer(
+        &self,
+        revision: u32,
+        payload: &[u8],
+        archive_len: u16,
+        crc: u32,
+        on_status: &mut dyn FnMut(&StreamStatus),
+    ) -> Result<()> {
+        let total = payload.len();
+        let deadline = Instant::now() + STORE_SAVE_TIMEOUT;
+        let mut s = self.store_begin(revision, archive_len, crc)?;
+        loop {
+            on_status(&s);
+            match s.phase {
+                PHASE_IDLE => {
+                    ensure!(
+                        s.revision == revision + 1 && s.pending_archive_len == archive_len && s.payload_crc == crc,
+                        "the save was not confirmed (store at revision {})",
+                        s.revision
+                    );
+                    return Ok(());
+                }
+                PHASE_FAILED => bail!("the device could not verify the saved profile"),
+                PHASE_ACTIVATION_FAILED => {
+                    bail!("the device could not apply the saved profile; unplug the BNK8 and plug it back in")
+                }
+                // Activation reports the new revision; its slot fields are checked once idle.
+                PHASE_ACTIVATING => ensure!(s.revision == revision + 1, "a different profile save is in progress"),
+                _ => ensure!(
+                    s.revision == revision && s.pending_archive_len == archive_len && s.payload_crc == crc,
+                    "a different profile save is in progress"
+                ),
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "the save did not finish within {STORE_SAVE_TIMEOUT:?} (phase {}); don't touch the keypad while saving",
+                s.phase
+            );
+            let received = s.received as usize;
+            if s.phase == PHASE_RECEIVE && received < total {
+                let n = 16.min(total - received).min(64 - received % 64);
+                match self.store_data(received as u16, &payload[received..received + n]) {
+                    Ok(next) => {
+                        s = next;
+                        continue;
+                    }
+                    // Staging busy (3) or offset out of step (4): resync from status.
+                    Err(e) if matches!(e.downcast_ref::<Nak>(), Some(Nak(3 | 4))) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            std::thread::sleep(STORE_POLL);
+            s = self.stream_status()?;
+        }
     }
 
     /// `0x15` sub 1: read `len` bytes (1..=0x16) at `offset` from the
@@ -375,23 +520,27 @@ impl Bnk8 {
     }
 
     /// Persists a full config: `0x11` sub-0 session, 134 chunks, `0x12`
-    /// commit. Clears a non-idle stream manager first (begins NAK 3
-    /// otherwise). On success the device's token B equals the blob's CRC.
+    /// commit. Waits for the profile store to be idle first (begins NAK 3
+    /// otherwise; cancelling would abort a Binepad Studio save in progress).
+    /// Refuses while the store holds a valid slot: the firmware then NAKs
+    /// sub-0 begins, so such devices are written with [`Bnk8::store_save`].
+    /// On success the device's token B equals the blob's CRC.
     pub fn write_config(&self, blob: &[u8; CONFIG_LEN]) -> Result<()> {
-        let stream = self.stream_status()?;
-        if stream.phase != PHASE_IDLE {
-            self.stream_finish(stream.revision)
-                .context("resetting the stream manager before a config write")?;
-        }
+        let stream = self.store_wait_idle()?;
+        ensure!(
+            stream.revision == 0,
+            "this BNK8 has a profile store slot (revision {}), so the firmware refuses `0x11` \
+             config writes; save through the profile store instead",
+            stream.revision
+        );
         let crc = crc32(blob);
         let status = self.status()?;
-        // The stream manager is idle here, so NAK 3 means another transfer session is
-        // still open, e.g. from a write that was interrupted. Its id cannot be recovered
-        // to abort it; a power cycle clears the session RAM.
+        // With the stream manager idle and no profile-store slot, NAK 3 means another
+        // transfer session is still open. The firmware drops it after 2.5 s without traffic.
         let session = self.transfer_begin_persist(status.token_a, crc).map_err(|e| match e.downcast_ref::<Nak>() {
             Some(Nak(3)) => e.context(
-                "the device refused to start a write, likely because an earlier write was \
-                 interrupted; unplug the BNK8, plug it back in, and try again",
+                "the device refused to start a write because another write session is open; \
+                 try again in a few seconds",
             ),
             _ => e,
         })?;

@@ -1,10 +1,11 @@
 //! TOML config model and its mapping onto the 2000-byte config blob.
 //!
 //! Layout per PROTOCOL.md "Config blob". `to_blob` starts from a base blob
-//! (the device's current config) and overwrites every modelled region, so
-//! bytes this model does not cover survive an apply unchanged.
+//! and overwrites every modelled region, so bytes this model does not cover
+//! survive an apply unchanged. The action table is ordered as Binepad
+//! Studio's compiler orders it, so a config Studio saved encodes to the same bytes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -147,11 +148,19 @@ pub struct Timing {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Layer {
+    /// Binepad Studio's layer name. Not part of the native config: kept only in
+    /// the device's profile store, on devices that have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// K1..K8: an action name (tap only) or a table of slots.
     pub keys: Vec<Key>,
     pub knob: Slots,
     pub lighting: Lighting,
 }
+
+/// Binepad Studio's action ids for `raw.*` action names, so the action
+/// table sorts as Studio's compiler sorts it (by id, then param).
+pub type StudioIds = BTreeMap<String, String>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(untagged)]
@@ -383,7 +392,7 @@ pub fn from_blob(b: &Blob) -> Result<Config> {
             .collect::<Result<_>>()?;
         let knob = slots(&km[KNOB_OFFSET..], &KNOB_SLOTS)?;
         let l = &b[OFF_LIGHTING + p * LIGHTING_LEN..][..LIGHTING_LEN];
-        out.push(Layer { keys, knob, lighting: decode_lighting(l, shared) });
+        out.push(Layer { name: None, keys, knob, lighting: decode_lighting(l, shared) });
     }
 
     let mut macros = BTreeMap::new();
@@ -539,8 +548,9 @@ fn encode_lighting(l: &Lighting, path: &str) -> Result<[u8; LIGHTING_LEN]> {
     Ok(out)
 }
 
-/// Encodes `cfg` over `base`, rewriting every modelled region.
-pub fn to_blob(cfg: &Config, base: &Blob) -> Result<Blob> {
+/// Encodes `cfg` over `base`, rewriting every modelled region. `ids` names
+/// `raw.*` actions for the table order; empty when there is no Studio profile.
+pub fn to_blob(cfg: &Config, base: &Blob, ids: &StudioIds) -> Result<Blob> {
     ensure!(cfg.format == FORMAT, "format: {} is not {FORMAT}", cfg.format);
     ensure!(cfg.device == DEVICE, "device: `{}` does not match `{DEVICE}`", cfg.device);
     let n_layers = cfg.layers.len();
@@ -550,6 +560,15 @@ pub fn to_blob(cfg: &Config, base: &Blob) -> Result<Blob> {
     ensure!((150..=2000).contains(&t.hold_ms), "timing.hold_ms: {} not in 150..=2000", t.hold_ms);
 
     // Resolve every binding to an action first, so the table can be built.
+    // Each action's sort id is its Studio id: the canonical name, or `ids` for `raw.*`.
+    let mut sort_ids: HashMap<Action, String> = HashMap::new();
+    let mut resolve_slot = |name: Option<&String>| -> Result<Option<Action>> {
+        let a = resolve(name, cfg)?;
+        if let (Some(a), Some(name)) = (a, name) {
+            sort_ids.entry(a).or_insert_with(|| ids.get(name).cloned().unwrap_or_else(|| actions::decode(a)));
+        }
+        Ok(a)
+    };
     let mut keymaps = Vec::with_capacity(n_layers);
     for (p, layer) in cfg.layers.iter().enumerate() {
         ensure!(layer.keys.len() == KEYS, "layers[{p}].keys: {} keys, expected {KEYS}", layer.keys.len());
@@ -560,33 +579,22 @@ pub fn to_blob(cfg: &Config, base: &Blob) -> Result<Blob> {
                 ensure!(s.get(slot).is_none(), "layers[{p}].keys[{k}].{slot}: only the knob turns");
             }
             for (i, slot) in KEY_SLOTS.iter().enumerate() {
-                let a = resolve(s.get(slot), cfg).with_context(|| format!("layers[{p}].keys[{k}].{slot}"))?;
+                let a = resolve_slot(s.get(slot)).with_context(|| format!("layers[{p}].keys[{k}].{slot}"))?;
                 km.push((KEY_OFFSETS[k] + i, a));
             }
         }
         for (i, slot) in KNOB_SLOTS.iter().enumerate() {
-            let a = resolve(layer.knob.get(slot), cfg).with_context(|| format!("layers[{p}].knob.{slot}"))?;
+            let a = resolve_slot(layer.knob.get(slot)).with_context(|| format!("layers[{p}].knob.{slot}"))?;
             km.push((KNOB_OFFSET + i, a));
         }
         keymaps.push(km);
     }
 
-    // Action table: keep surviving base entries in base order, append new ones.
-    let base_count = (base[OFF_ACTION_COUNT] as usize).min(MAX_ACTIONS);
-    let used: Vec<Action> = keymaps.iter().flatten().filter_map(|(_, a)| *a).collect();
-    let mut table: Vec<Action> = Vec::new();
-    for i in 0..base_count {
-        let o = OFF_ACTIONS + i * ENTRY_LEN;
-        let a = Action::from_bytes(base[o..o + ENTRY_LEN].try_into().unwrap());
-        if used.contains(&a) && !table.contains(&a) {
-            table.push(a);
-        }
-    }
-    for a in &used {
-        if !table.contains(a) {
-            table.push(*a);
-        }
-    }
+    // Action table: distinct actions sorted by Studio id (ordinal), then param,
+    // as Studio's `Bnk8ProfileCodec.Compile` orders it.
+    let mut table: Vec<Action> = sort_ids.keys().copied().collect();
+    let order = |a: &Action| (sort_ids[a].clone().into_bytes(), a.param, a.kind, a.id);
+    table.sort_by_key(order);
     ensure!(table.len() <= MAX_ACTIONS, "{} distinct actions, the device stores at most {MAX_ACTIONS}", table.len());
 
     let mut b = *base;
@@ -672,6 +680,9 @@ pub fn flatten(cfg: &Config) -> Vec<(String, String)> {
     ];
     let show = |s: Option<&String>| s.cloned().unwrap_or_else(|| NONE.into());
     for (p, layer) in cfg.layers.iter().enumerate() {
+        if let Some(name) = &layer.name {
+            v.push((format!("layers[{p}].name"), format!("{name:?}")));
+        }
         for (k, key) in layer.keys.iter().enumerate() {
             let s = key.slots();
             for slot in KEY_SLOTS {
@@ -826,12 +837,12 @@ mod tests {
     #[test]
     fn factory_round_trips_byte_for_byte() {
         let cfg = from_blob(FACTORY).unwrap();
-        assert_eq!(&to_blob(&cfg, FACTORY).unwrap(), FACTORY);
+        assert_eq!(&to_blob(&cfg, FACTORY, &StudioIds::new()).unwrap(), FACTORY);
         // And through TOML text.
         let text = to_toml(&cfg).unwrap();
         let back = from_toml(&text).unwrap();
         assert_eq!(back, cfg);
-        assert_eq!(&to_blob(&back, FACTORY).unwrap(), FACTORY);
+        assert_eq!(&to_blob(&back, FACTORY, &StudioIds::new()).unwrap(), FACTORY);
     }
 
     #[test]
@@ -851,7 +862,7 @@ mod tests {
     fn set_key_changes_only_that_binding() {
         let mut cfg = from_blob(FACTORY).unwrap();
         cfg.layers[0].keys[0] = Key::Tap("keyboard.a".into());
-        let blob = to_blob(&cfg, FACTORY).unwrap();
+        let blob = to_blob(&cfg, FACTORY, &StudioIds::new()).unwrap();
         let back = from_blob(&blob).unwrap();
         assert_eq!(
             diff(&from_blob(FACTORY).unwrap(), &back),
@@ -878,10 +889,10 @@ mod tests {
     fn validation_errors_carry_paths() {
         let mut cfg = from_blob(FACTORY).unwrap();
         cfg.layers[1].keys[3] = Key::Tap("macro.4".into());
-        let e = format!("{:#}", to_blob(&cfg, FACTORY).unwrap_err());
+        let e = format!("{:#}", to_blob(&cfg, FACTORY, &StudioIds::new()).unwrap_err());
         assert!(e.starts_with("layers[1].keys[3].tap"), "{e}");
         cfg.layers[1].keys.pop();
-        let e = to_blob(&cfg, FACTORY).unwrap_err().to_string();
+        let e = to_blob(&cfg, FACTORY, &StudioIds::new()).unwrap_err().to_string();
         assert!(e.starts_with("layers[1].keys: 7 keys"), "{e}");
     }
 
@@ -889,7 +900,7 @@ mod tests {
     #[test]
     fn rejects_configs_that_would_not_round_trip() {
         let base = from_blob(FACTORY).unwrap();
-        let err = |cfg: &Config| format!("{:#}", to_blob(cfg, FACTORY).unwrap_err());
+        let err = |cfg: &Config| format!("{:#}", to_blob(cfg, FACTORY, &StudioIds::new()).unwrap_err());
 
         let mut cfg = base.clone();
         cfg.macros.insert("3".into(), vec![]);
@@ -946,7 +957,8 @@ flags = 1
         assert_eq!(old, new);
         assert_eq!(old.layers[0].keys[0], Key::Tap("keyboard.arrow_up".into()));
         assert_eq!(old.macros["1"][0], "press modifier.left_control");
-        assert_eq!(to_blob(&old, FACTORY).unwrap(), to_blob(&new, FACTORY).unwrap());
+        let ids = StudioIds::new();
+        assert_eq!(to_blob(&old, FACTORY, &ids).unwrap(), to_blob(&new, FACTORY, &ids).unwrap());
         let e = from_toml(&v2.replace("format = 2", "format = 3")).unwrap_err().to_string();
         assert!(e.contains("format = 3"), "{e}");
     }
@@ -960,14 +972,14 @@ flags = 1
         for l in &mut cfg.layers {
             l.lighting.shared = true;
         }
-        let blob = to_blob(&cfg, FACTORY).unwrap();
+        let blob = to_blob(&cfg, FACTORY, &StudioIds::new()).unwrap();
         let l0 = &blob[OFF_LIGHTING..][..LIGHTING_LEN];
         assert_eq!(l0[3], 0x07);
         assert_eq!(l0[OFF_KEY_COLORS + 2 * 4..][..4], [1, 0x11, 0x22, 0x33]);
         assert_eq!(from_blob(&blob).unwrap(), cfg);
 
         cfg.layers[1].lighting.shared = false;
-        let e = to_blob(&cfg, FACTORY).unwrap_err().to_string();
+        let e = to_blob(&cfg, FACTORY, &StudioIds::new()).unwrap_err().to_string();
         assert!(e.contains("layers[1].lighting.shared"), "{e}");
     }
 

@@ -4,10 +4,12 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use hidapi::HidApi;
 
-use bnk8::config::{self, Blob, Changes, Config, FACTORY, KEY_SLOTS, KNOB_SLOTS, Key};
+use bnk8::config::{self, Changes, Config, FACTORY, KEY_SLOTS, KNOB_SLOTS, Key, StudioIds};
 use bnk8::frame::{self, Frame, REPORT_LEN};
 use bnk8::store::{self, Current, Source};
 use bnk8::{actions, protocol, transport};
+
+mod mcp;
 
 /// Program the Binepad BNK8 AI Edition.
 #[derive(Parser)]
@@ -47,6 +49,9 @@ enum Command {
     },
     /// Restore the factory default config.
     Reset,
+    /// Run an MCP server on stdin/stdout so Claude Desktop or Claude Code can
+    /// read the config, preview edits and apply them.
+    Mcp,
     /// Internal reverse-engineering probes.
     #[command(hide = true)]
     Probe {
@@ -111,12 +116,18 @@ enum Set {
 
 #[derive(Subcommand)]
 enum Probe {
-    /// Initialise the stream flash area so RAM-only config sessions unlock.
-    Stream,
     /// Reset a stuck stream session (0x15 sub 4).
     Finish,
     /// Dump the raw 22-byte stream status payload.
     Status,
+    /// Write the profile store's active slot (native config, then archive) to a file.
+    StoreDump {
+        #[arg(short, long)]
+        output: String,
+    },
+    /// Save the profile store's active slot again, byte for byte, logging every
+    /// store status (exercises the save sequence without changing the config).
+    StoreResave,
 }
 
 fn main() -> Result<()> {
@@ -129,10 +140,12 @@ fn main() -> Result<()> {
         Command::Apply { file, dry_run } => apply(serial, &file, dry_run),
         Command::Set { what } => set(serial, what),
         Command::Reset => reset(serial),
+        Command::Mcp => mcp::serve(serial, std::io::stdin().lock(), std::io::stdout().lock()),
         Command::Probe { what } => match what {
-            Probe::Stream => probe_stream(serial),
             Probe::Finish => probe_finish(serial),
             Probe::Status => probe_status(serial),
+            Probe::StoreDump { output } => probe_store_dump(serial, &output),
+            Probe::StoreResave => probe_store_resave(serial),
         },
         Command::Raw {
             hex,
@@ -149,28 +162,30 @@ fn unknown_config(crc: u32) -> anyhow::Error {
     )
 }
 
-/// The device's current config; errors when it cannot be identified.
-fn known(dev: &transport::Bnk8) -> Result<Blob> {
+/// The device's current config, with layer names; errors when it cannot be identified.
+fn known(dev: &transport::Bnk8) -> Result<Config> {
     match store::current(dev)? {
-        Current::Known(blob, _) => Ok(*blob),
+        Current::Known(blob, source) => store::config(&blob, &source),
         Current::Unknown { crc } => Err(unknown_config(crc)),
     }
 }
 
-/// Encodes `cfg` over `base`, prints the per-item diff against `before`
-/// (if known), and writes unless `dry_run`.
-fn write(dev: &transport::Bnk8, before: Option<&Blob>, base: &Blob, cfg: &Config, dry_run: bool) -> Result<()> {
-    let blob = config::to_blob(cfg, base)?;
-    let changes = match config::changes(before, &blob)? {
+/// Prints what writing `cfg` changes on the device, and writes it unless `dry_run`.
+fn write(dev: &transport::Bnk8, cfg: &Config, dry_run: bool) -> Result<()> {
+    let prepared = store::prepare(dev, cfg)?;
+    for n in &prepared.notes {
+        println!("note: {n}");
+    }
+    let changes = match &prepared.changes {
         Changes::Items(lines) => {
-            for l in &lines {
+            for l in lines {
                 println!("{l}");
             }
             lines.len()
         }
         Changes::Unknown => {
             println!("device config unknown: the whole config will be written");
-            config::flatten(&config::from_blob(&blob)?).len()
+            config::flatten(&config::from_blob(&prepared.native)?).len()
         }
     };
     if changes == 0 {
@@ -181,14 +196,14 @@ fn write(dev: &transport::Bnk8, before: Option<&Blob>, base: &Blob, cfg: &Config
         println!("{changes} changes (dry run, nothing written)");
         return Ok(());
     }
-    store::write(dev, &blob)?;
+    store::commit(dev, &prepared)?;
     println!("applied {changes} changes");
     Ok(())
 }
 
 fn dump(serial: Option<&str>, output: Option<&str>) -> Result<()> {
     let dev = transport::open(serial)?;
-    let text = config::to_toml(&config::from_blob(&known(&dev)?)?)?;
+    let text = config::to_toml(&known(&dev)?)?;
     match output {
         Some(path) => std::fs::write(path, text).with_context(|| format!("writing {path}")),
         None => {
@@ -202,12 +217,9 @@ fn apply(serial: Option<&str>, file: &str, dry_run: bool) -> Result<()> {
     let text = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
     let cfg = config::from_toml(&text).with_context(|| format!("parsing {file}"))?;
     // Validate before touching the device.
-    config::to_blob(&cfg, FACTORY).with_context(|| format!("validating {file}"))?;
+    config::to_blob(&cfg, FACTORY, &StudioIds::new()).with_context(|| format!("validating {file}"))?;
     let dev = transport::open(serial)?;
-    match store::current(&dev)? {
-        Current::Known(cur, _) => write(&dev, Some(&cur), &cur, &cfg, dry_run),
-        Current::Unknown { .. } => write(&dev, None, FACTORY, &cfg, dry_run),
-    }
+    write(&dev, &cfg, dry_run)
 }
 
 fn layer_mut(cfg: &mut Config, layer: usize) -> Result<&mut config::Layer> {
@@ -218,8 +230,7 @@ fn layer_mut(cfg: &mut Config, layer: usize) -> Result<&mut config::Layer> {
 
 fn set(serial: Option<&str>, what: Set) -> Result<()> {
     let dev = transport::open(serial)?;
-    let cur = known(&dev)?;
-    let mut cfg = config::from_blob(&cur)?;
+    let mut cfg = known(&dev)?;
     let binding = |action: String| (action != "none").then_some(action);
     match what {
         Set::Key { key, action, layer, slot } => {
@@ -247,76 +258,56 @@ fn set(serial: Option<&str>, what: Set) -> Result<()> {
             l.flags = None;
         }
     }
-    write(&dev, Some(&cur), &cur, &cfg, false)
+    write(&dev, &cfg, false)
 }
 
+/// Restores the factory bindings and lighting; on a device with a profile
+/// store, layers keep their names.
 fn reset(serial: Option<&str>) -> Result<()> {
     let dev = transport::open(serial)?;
-    store::write(&dev, FACTORY)?;
-    println!("restored the factory config");
+    write(&dev, &config::from_blob(FACTORY)?, false)
+}
+
+/// Writes the profile store's active slot (native config, then archive) to `output`.
+fn probe_store_dump(serial: Option<&str>, output: &str) -> Result<()> {
+    let dev = transport::open(serial)?;
+    let s = dev.store_wait_idle()?;
+    ensure!(s.revision != 0, "the device has no profile store slot");
+    let payload = dev.profile_store_read(s.revision, s.native_len as usize + s.archive_len as usize)?;
+    ensure!(protocol::crc32(&payload) == s.payload_crc, "profile store payload fails its CRC");
+    std::fs::write(output, &payload).with_context(|| format!("writing {output}"))?;
+    println!("revision {}: {} bytes to {output}", s.revision, payload.len());
     Ok(())
 }
 
-const STREAM_SIZE: u16 = 0x30; // minimum accepted stream payload size
-
-fn poll_state(dev: &transport::Bnk8, want: u8, tries: u32) -> Result<protocol::StreamStatus> {
-    for _ in 0..tries {
-        let s = dev.stream_status()?;
-        println!("  phase={} revision={:#010x} archive={:#06x}", s.phase, s.revision, s.archive_len);
-        if s.phase == want {
-            return Ok(s);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    bail!("stream phase never reached {want}");
-}
-
-/// Drive the `0x15` stream write flow to create a valid stream slot,
-/// which unlocks `0x11` sub-4 RAM-only config sessions.
-fn probe_stream(serial: Option<&str>) -> Result<()> {
+fn probe_store_resave(serial: Option<&str>) -> Result<()> {
     let dev = transport::open(serial)?;
-    let s = dev.stream_status()?;
-    println!("before: phase={} revision={:#010x} archive={:#06x}", s.phase, s.revision, s.archive_len);
-    let total = protocol::CONFIG_LEN + STREAM_SIZE as usize;
-    let data = vec![0u8; total];
-    let crc = protocol::crc32(&data);
-    println!("begin: revision={:#010x} archive={STREAM_SIZE:#06x} crc={crc:#010x}", s.revision);
-    dev.stream_begin(s.revision, STREAM_SIZE, crc)?;
-    poll_state(&dev, 4, 40)?;
-    println!("phase 4 (ready for data), pushing {total} zero bytes");
-    let mut sent = 0usize;
-    let mut retries = 0u32;
-    while sent < total {
-        let n = (total - sent).min(16);
-        match dev.stream_data(sent as u16, &data[sent..sent + n]) {
-            Ok(()) => {
-                sent += n;
-                retries = 0;
-                if sent % 256 < 16 {
-                    let p = dev.stream_status_payload()?;
-                    println!(
-                        "  {sent}/{total} phase={} counter={}",
-                        p[1],
-                        u16::from_le_bytes([p[12], p[13]])
-                    );
-                }
-            }
-            Err(e) => {
-                retries += 1;
-                ensure!(retries < 2000, "stuck at {sent}/{total}: {e}");
-                std::thread::sleep(Duration::from_millis(2));
-            }
+    let s = dev.store_wait_idle()?;
+    ensure!(s.revision != 0, "the device has no profile store slot");
+    let payload = dev.profile_store_read(s.revision, s.native_len as usize + s.archive_len as usize)?;
+    ensure!(protocol::crc32(&payload) == s.payload_crc, "profile store payload fails its CRC");
+    println!("re-saving revision {} ({} bytes, CRC {:#010x})", s.revision, payload.len(), s.payload_crc);
+    let start = Instant::now();
+    let mut last = (u8::MAX, u16::MAX);
+    dev.store_save(s.revision, &payload, &mut |st| {
+        // Log phase changes, and every 512 bytes received.
+        if st.phase != last.0 || st.received / 512 != last.1 / 512 {
+            println!(
+                "  +{:>5}ms phase={:>2} revision={} received={}",
+                start.elapsed().as_millis(),
+                st.phase,
+                st.revision,
+                st.received
+            );
+            last = (st.phase, st.received);
         }
-    }
-    println!("all data accepted, waiting for finalize");
-    let s = poll_state(&dev, protocol::PHASE_IDLE, 60)?;
-    ensure!(s.revision != 0, "stream slot still invalid after write");
-    let readback = dev.stream_read(s.revision, 0, 16)?;
+    })?;
+    let after = dev.stream_status()?;
     println!(
-        "slot valid: revision={:#010x} archive={:#06x} read[0..16]={}",
-        s.revision,
-        s.archive_len,
-        to_hex(&readback)
+        "  +{:>5}ms done: revision {}, token B {:#010x}, read back identical",
+        start.elapsed().as_millis(),
+        after.revision,
+        dev.status()?.token_b
     );
     Ok(())
 }
@@ -325,7 +316,7 @@ fn probe_finish(serial: Option<&str>) -> Result<()> {
     let dev = transport::open(serial)?;
     let s = dev.stream_status()?;
     println!("before: phase={} revision={:#010x}", s.phase, s.revision);
-    dev.stream_finish(s.revision)?;
+    dev.store_cancel(s.revision)?;
     let s = dev.stream_status()?;
     println!("after:  phase={} revision={:#010x}", s.phase, s.revision);
     Ok(())
@@ -384,14 +375,12 @@ fn info(serial: Option<&str>) -> Result<()> {
     );
     match store::current(&dev)? {
         Current::Known(blob, source) => {
-            let cfg = config::from_blob(&blob)?;
-            let (label, names) = match &source {
-                Source::Factory => ("factory default".to_string(), &[][..]),
-                Source::OlderFactory(version) => (format!("factory default of firmware {version}"), &[][..]),
-                Source::Snapshot => ("matches the local snapshot".to_string(), &[][..]),
-                Source::ProfileStore { layer_names } => {
-                    ("read from the device (saved by Binepad Studio)".to_string(), layer_names.as_slice())
-                }
+            let cfg = store::config(&blob, &source)?;
+            let label = match &source {
+                Source::Factory => "factory default".to_string(),
+                Source::OlderFactory(version) => format!("factory default of firmware {version}"),
+                Source::Snapshot => "matches the local snapshot".to_string(),
+                Source::ProfileStore { .. } => "read from the device's profile store".to_string(),
             };
             println!(
                 "  config:    {label}, CRC {:#010x}, {} layers, {} macros",
@@ -399,9 +388,12 @@ fn info(serial: Option<&str>) -> Result<()> {
                 cfg.layers.len(),
                 cfg.macros.len()
             );
-            // Studio's names live in its archive, not the config, so `dump` can't carry them.
-            let named: Vec<String> =
-                names.iter().enumerate().filter_map(|(i, n)| Some(format!("{i} {}", n.as_ref()?))).collect();
+            let named: Vec<String> = cfg
+                .layers
+                .iter()
+                .enumerate()
+                .filter_map(|(i, l)| Some(format!("{i} {}", l.name.as_ref()?)))
+                .collect();
             if !named.is_empty() {
                 println!("  layers:    {}", named.join(", "));
             }

@@ -12,7 +12,7 @@ It programs key bindings, knob gestures, macros, lighting and timing directly ov
 
 | Part | Path | What it does |
 |---|---|---|
-| `bnk8` CLI | `src/` | List devices, dump the config as TOML, apply a TOML config, change single bindings, factory reset |
+| `bnk8` CLI | `src/` | List devices, dump the config as TOML, apply a TOML config, change single bindings, factory reset, MCP server for Claude |
 | `bnk8-gui` | `gui/` | Desktop configurator: keypad editor, macros, timing, lighting, layer templates |
 | Protocol notes | [`PROTOCOL.md`](PROTOCOL.md) | Reverse-engineered frame format, commands and 2000-byte config layout |
 
@@ -86,6 +86,33 @@ bnk8 set lighting --layer 0 --effect solid --color "#730000" --brightness 80
 
 Keys are numbered 1 to 8 from top left to bottom right, skipping the knob (top right). With several devices attached, add `--serial <SERIAL>` (see `bnk8 list`).
 
+## Use with Claude
+
+`bnk8 mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io) server on stdin/stdout. Add it to Claude Desktop or Claude Code, which run on your own Claude subscription, and ask Claude to build macros, bindings, knob gestures or lighting for you.
+
+Claude gets four tools:
+
+- `get_config`: reads the current config as TOML.
+- `list_actions`: lists the action names a binding or macro step can use.
+- `preview_config`: validates an edited config and lists the per-item changes, without writing. It returns a preview id.
+- `apply_config`: writes the config. It needs the preview id for that exact config and an unchanged device, so you always see the changes before anything is written.
+
+Your client asks you to approve each tool call. The keypad is opened only for the duration of a call, so Binepad Studio, the desktop app and the CLI can keep using it.
+
+**Claude Desktop:** add this to `~/Library/Application Support/Claude/claude_desktop_config.json`, then restart Desktop:
+
+```json
+{"mcpServers": {"bnk8": {"command": "/usr/local/bin/bnk8", "args": ["mcp"]}}}
+```
+
+**Claude Code:**
+
+```sh
+claude mcp add bnk8 -- /usr/local/bin/bnk8 mcp
+```
+
+Use the path where you installed `bnk8`. To pick one of several keypads, add `--serial <SERIAL>` before `mcp`.
+
 ## Config format
 
 ```toml
@@ -97,6 +124,7 @@ double_tap_ms = 260
 hold_ms = 350
 
 [[layers]]                     # up to 10 layers
+name = "Media"                 # optional; kept on keypads Binepad Studio has saved to
 keys = [
     "keyboard.arrow_up",       # K1 tap only
     "keyboard.arrow_down",     # K2
@@ -152,9 +180,22 @@ Keep a `layer.next` binding (factory: knob press) on every layer so you can alwa
 
 ## How reading the config works
 
-The device reports a CRC-32 of its active config, and bnk8 trusts a config only when its CRC matches. It looks in three places: the file it saves after every write (`~/.local/state/bnk8/<serial>.bin`, or `$XDG_STATE_HOME/bnk8/`), the built-in factory config (also those of firmware 6.0.19, 6.0.21 and 6.0.24), and the copy Binepad Studio keeps on the device when it saves. With Studio's copy, `bnk8 info` and the app also show Studio's layer names; they aren't part of the config, so the TOML doesn't carry them.
+The device reports a CRC-32 of its active config, and bnk8 trusts a config only when its CRC matches. It looks in three places: the copy saved in the device's profile store (where Binepad Studio, and then bnk8, save), the file bnk8 saves after every write (`~/.local/state/bnk8/<serial>.bin`, or `$XDG_STATE_HOME/bnk8/`), and the built-in factory config (also those of firmware 6.0.19, 6.0.21 and 6.0.24). With the profile store's copy, `dump`, `info` and the app also show the layer names.
 
 If none of them matches (for example, another tool wrote the config), it shows as **unknown**: editing starts from the factory defaults, and applying writes the whole config. Every write replaces all 2000 bytes; the per-item changes shown are for your review.
+
+## Keypads Binepad Studio has saved to
+
+Once Binepad Studio has saved to the keypad, the firmware accepts config writes only through its profile store, and reloads that copy at every power-up. bnk8 then saves there the way Studio does: the config together with Studio's profile, updated to match. Studio and its background agent see bnk8's changes and keep them, and Studio's own settings (layer names, app switching rules, desktop macros) are preserved.
+
+Studio's profile can't hold everything a TOML file can, so on these keypads bnk8 refuses, before writing anything:
+
+- timing other than `double_tap_ms = 260` and `hold_ms = 350` (Studio's profile has no timing settings);
+- effects without a name, and lighting `flags` or `extra`;
+- actions on a gesture Studio doesn't allow for them (for example `layer.mo.N` only on tap), and `raw.*` actions Studio doesn't know;
+- a model/effort selector (`claude.model-effort.knob`, …) that doesn't take the whole knob: tap and both turns.
+
+Layers without a `name` keep the name they have. Keypads Studio has never saved to are written directly, as before, and don't keep layer names.
 
 Details are in [`PROTOCOL.md`](PROTOCOL.md). bnk8 never sends message `0x42` (factory reset or a flash rewrite; unresolved).
 

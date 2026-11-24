@@ -181,11 +181,12 @@ pub fn add(cfg: &mut Config, preset: &Preset, lighting: &Lighting) -> Result<usi
         );
     }
     next.layers.push(Layer {
+        name: Some(preset.name.into()),
         keys: keys.into_iter().map(Key::from_slots).collect(),
         knob,
         lighting: Lighting { color: preset.color.into(), key_colors: None, extra: None, flags: None, ..lighting.clone() },
     });
-    config::to_blob(&next, FACTORY)?;
+    config::to_blob(&next, FACTORY, &config::StudioIds::new())?;
     *cfg = next;
     Ok(cfg.layers.len() - 1)
 }

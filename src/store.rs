@@ -1,19 +1,24 @@
-//! Identifying the device's active config, and the local snapshot of the
-//! last config bnk8 wrote, per device serial.
+//! Identifying the device's active config, writing new configs, and the
+//! local snapshot of the last config bnk8 wrote, per device serial.
 //!
 //! `0x10` status token B is the CRC-32 of the active config, so any blob
-//! whose CRC equals token B is exactly what the device holds. The candidates,
-//! cheapest first (PROTOCOL.md "The read model"): bnk8's local snapshot, the
-//! factory config (of the current or an older firmware), and the copy of the
-//! native config in the device's profile store, which Binepad Studio writes
-//! when it saves.
+//! whose CRC equals token B is exactly what the device holds. The candidates
+//! (PROTOCOL.md "The read model"): the device's profile store, which Binepad
+//! Studio (and bnk8) save through; bnk8's local snapshot; and the factory
+//! config (of the current or an older firmware).
+//!
+//! Writes go through the profile store when the device has a slot there (the
+//! firmware then refuses `0x11` writes), together with Studio's profile JSON,
+//! updated so Studio and its agent see the same config. Devices without a
+//! slot are written with `0x11`.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 
-use crate::archive;
-use crate::config::{Blob, FACTORY, OLDER_FACTORY, older_factory};
+use crate::archive::{self, Document};
+use crate::config::{self, Blob, Changes, Config, FACTORY, OLDER_FACTORY, StudioIds, older_factory};
+use crate::profile;
 use crate::protocol::{CONFIG_LEN, Nak, PHASE_IDLE, STREAM_SIZE_MAX, crc32};
 use crate::transport::Bnk8;
 
@@ -22,8 +27,8 @@ pub enum Source {
     Factory,
     /// The factory config of an older firmware version.
     OlderFactory(&'static str),
-    /// Read back from the device's profile store (last saved by Binepad Studio),
-    /// with Studio's layer names from its archive, one entry per layer.
+    /// Read back from the device's profile store (saved by Binepad Studio or
+    /// bnk8), with the layer names from its profile, one entry per layer.
     ProfileStore { layer_names: Vec<Option<String>> },
 }
 
@@ -55,8 +60,63 @@ fn path(serial: &str) -> Result<PathBuf> {
     Ok(dir()?.join(format!("{serial}.bin")))
 }
 
+/// The profile store's active slot.
+struct Slot {
+    revision: u32,
+    /// Native config, then the archive.
+    payload: Vec<u8>,
+}
+
+impl Slot {
+    fn native(&self) -> Blob {
+        self.payload[..CONFIG_LEN].try_into().unwrap()
+    }
+
+    fn archive(&self) -> &[u8] {
+        &self.payload[CONFIG_LEN..]
+    }
+}
+
+/// The profile store's active slot; `None` when there is none, or on firmware
+/// without a profile store (it NAKs the status request).
+fn read_slot(dev: &Bnk8) -> Result<Option<Slot>> {
+    let s = match dev.stream_status() {
+        Ok(s) if s.phase == PHASE_IDLE => s,
+        Ok(_) => dev.store_wait_idle()?,
+        Err(e) if e.downcast_ref::<Nak>().is_some() => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if s.revision == 0 {
+        return Ok(None);
+    }
+    ensure!(
+        s.native_len as usize == CONFIG_LEN && s.archive_len <= STREAM_SIZE_MAX,
+        "the profile store holds {} + {} bytes, not a BNK8 profile",
+        s.native_len,
+        s.archive_len
+    );
+    let payload = dev.profile_store_read(s.revision, CONFIG_LEN + s.archive_len as usize)?;
+    ensure!(crc32(&payload) == s.payload_crc, "the profile store's contents fail their CRC check");
+    Ok(Some(Slot { revision: s.revision, payload }))
+}
+
 pub fn current(dev: &Bnk8) -> Result<Current> {
     let crc = dev.status()?.token_b;
+    if let Some(slot) = read_slot(dev)? {
+        let native = slot.native();
+        if crc32(&native) == crc {
+            // Token B already proves the native config; names are best effort.
+            let mut layer_names = vec![None; native[5] as usize]; // byte 5: layer count
+            if let Ok(doc) = archive::decode(slot.archive()) {
+                for (i, name) in archive::layer_names(&doc.profile) {
+                    if let Some(n) = layer_names.get_mut(i) {
+                        *n = Some(name);
+                    }
+                }
+            }
+            return Ok(Current::Known(Box::new(native), Source::ProfileStore { layer_names }));
+        }
+    }
     // Without a state directory there is no snapshot, but the factory check still applies.
     if let Ok(p) = path(dev.serial())
         && let Some(bytes) = read_snapshot(&p)?
@@ -71,36 +131,128 @@ pub fn current(dev: &Bnk8) -> Result<Current> {
     if let Some((version, _, colors)) = OLDER_FACTORY.iter().find(|(_, c, _)| *c == crc) {
         return Ok(Current::Known(Box::new(older_factory(colors)), Source::OlderFactory(version)));
     }
-    // Firmware without the profile store NAKs the status request.
-    let stream = match dev.stream_status() {
-        Ok(s) => s,
-        Err(e) if e.downcast_ref::<Nak>().is_some() => return Ok(Current::Unknown { crc }),
-        Err(e) => return Err(e),
-    };
-    if stream.phase == PHASE_IDLE
-        && stream.revision != 0
-        && stream.native_len as usize == CONFIG_LEN
-        && stream.archive_len <= STREAM_SIZE_MAX
-    {
-        let payload = dev.profile_store_read(stream.revision, CONFIG_LEN + stream.archive_len as usize)?;
-        let blob = Blob::try_from(&payload[..CONFIG_LEN]).unwrap();
-        if crc32(&blob) == crc {
-            // Token B already proves the native config; names are best effort.
-            let mut layer_names = vec![None; blob[5] as usize]; // byte 5: layer count
-            if crc32(&payload) == stream.payload_crc
-                && let Ok(found) = archive::layer_names(&payload[CONFIG_LEN..])
-            {
-                for (i, name) in found {
-                    if let Some(slot) = layer_names.get_mut(i) {
-                        *slot = Some(name);
-                    }
-                }
-            }
-            // Not saved as a snapshot: the snapshot records bnk8's own writes.
-            return Ok(Current::Known(Box::new(blob), Source::ProfileStore { layer_names }));
+    Ok(Current::Unknown { crc })
+}
+
+/// Decodes a known config, with the profile store's layer names.
+pub fn config(blob: &Blob, source: &Source) -> Result<Config> {
+    let mut cfg = config::from_blob(blob)?;
+    if let Source::ProfileStore { layer_names } = source {
+        for (l, n) in cfg.layers.iter_mut().zip(layer_names) {
+            l.name.clone_from(n);
         }
     }
-    Ok(Current::Unknown { crc })
+    Ok(cfg)
+}
+
+/// A config encoded for the device's current state, ready to [`commit`].
+pub struct Prepared {
+    /// The native config to write.
+    pub native: Blob,
+    /// What writing it changes, per item.
+    pub changes: Changes,
+    /// CRC of the device's active config when this was prepared.
+    pub device_crc: u32,
+    /// Remarks for the user, e.g. settings that can't be kept.
+    pub notes: Vec<String>,
+    /// Profile store slot revision to save over, and the archive to save.
+    store: Option<(u32, Vec<u8>)>,
+}
+
+impl Prepared {
+    /// True when the device already has this config.
+    pub fn unchanged(&self) -> bool {
+        matches!(&self.changes, Changes::Items(lines) if lines.is_empty())
+    }
+
+    /// True when the write goes through the profile store (layer names are kept).
+    pub fn saves_to_profile_store(&self) -> bool {
+        self.store.is_some()
+    }
+}
+
+/// `cfg` with `names`' layer names, where it has none.
+fn with_names(mut cfg: Config, names: &Config) -> Config {
+    for (l, n) in cfg.layers.iter_mut().zip(&names.layers) {
+        if l.name.is_none() {
+            l.name.clone_from(&n.name);
+        }
+    }
+    cfg
+}
+
+/// Encodes `cfg` for the device's current state and works out what writing
+/// it would change. Nothing is written.
+///
+/// On a device with a profile store slot, the device's saved Studio profile is
+/// updated to match `cfg` (layers without a name keep their previous one); `cfg`
+/// is refused when a Studio profile can't express it exactly.
+pub fn prepare(dev: &Bnk8, cfg: &Config) -> Result<Prepared> {
+    let device_crc = dev.status()?.token_b;
+    let Some(slot) = read_slot(dev)? else {
+        let mut cfg = cfg.clone();
+        let mut notes = Vec::new();
+        if cfg.layers.iter().any(|l| l.name.is_some()) {
+            notes.push("layer names are kept only on keypads Binepad Studio has saved to, so they are ignored".into());
+            cfg.layers.iter_mut().for_each(|l| l.name = None);
+        }
+        let ids = StudioIds::new();
+        let (native, changes) = match current(dev)? {
+            Current::Known(cur, _) => {
+                let native = config::to_blob(&cfg, &cur, &ids)?;
+                let changes = config::changes(Some(&cur), &native)?;
+                (native, changes)
+            }
+            Current::Unknown { .. } => (config::to_blob(&cfg, FACTORY, &ids)?, Changes::Unknown),
+        };
+        return Ok(Prepared { native, changes, device_crc, notes, store: None });
+    };
+
+    let prev_native = slot.native();
+    ensure!(
+        crc32(&prev_native) == device_crc,
+        "the device's active config differs from its saved profile; unplug the BNK8, plug it back in and try again"
+    );
+    let doc = archive::decode(slot.archive()).context("reading the device's saved Binepad Studio profile")?;
+    let (prev_cfg, aliases) =
+        profile::from_profile(&doc.profile, &prev_native).context("reading the device's saved Binepad Studio profile")?;
+    let ids = aliases.ids();
+    // bnk8's reading of Studio's profile must reproduce the device's config,
+    // or the profile it writes back could compile to something else.
+    ensure!(
+        config::to_blob(&prev_cfg, FACTORY, &ids)? == prev_native,
+        "bnk8 can't reproduce the device's saved Binepad Studio profile exactly, so it won't update it; \
+         make this change in Binepad Studio"
+    );
+
+    let cfg = with_names(cfg.clone(), &prev_cfg);
+    let native = config::to_blob(&cfg, FACTORY, &ids)?;
+    let new_profile = profile::to_profile(&cfg, &doc.profile, &aliases, &profile::now_utc())?;
+    // What Studio will compile from the new profile must be exactly `native`.
+    let (check, check_aliases) = profile::from_profile(&new_profile, &native)?;
+    let compiled = config::to_blob(&check, FACTORY, &check_aliases.ids())?;
+    if compiled != native {
+        let first = config::diff(&config::from_blob(&native)?, &config::from_blob(&compiled)?).into_iter().next();
+        bail!(
+            "bnk8 can't express this config exactly as a Binepad Studio profile ({})",
+            first.unwrap_or_else(|| "action table order".into())
+        );
+    }
+    let archive = archive::encode(&Document { device_id: doc.device_id, profile: new_profile })?;
+
+    let before = with_names(config::from_blob(&prev_native)?, &prev_cfg);
+    let after = with_names(config::from_blob(&native)?, &cfg);
+    let mut lines = config::diff(&before, &after);
+    if lines.is_empty() && native != prev_native {
+        lines.push("action table: reordered, bindings unchanged".into());
+    }
+    Ok(Prepared {
+        native,
+        changes: Changes::Items(lines),
+        device_crc,
+        notes: Vec::new(),
+        store: Some((slot.revision, archive)),
+    })
 }
 
 fn save(p: &Path, blob: &Blob) -> Result<()> {
@@ -109,14 +261,22 @@ fn save(p: &Path, blob: &Blob) -> Result<()> {
     std::fs::rename(&tmp, p).with_context(|| format!("replacing {}", p.display()))
 }
 
-/// Persists `blob` to the device and records it as the snapshot. The snapshot
+/// Writes a prepared config, and records it as the snapshot. Fails without
+/// writing if the device's config changed since [`prepare`]. The snapshot
 /// directory is prepared first, so an unusable one fails before the device is touched.
-pub fn write(dev: &Bnk8, blob: &Blob) -> Result<()> {
-    let p = path(dev.serial())?;
-    let d = p.parent().unwrap();
+pub fn commit(dev: &Bnk8, p: &Prepared) -> Result<()> {
+    let snapshot = path(dev.serial())?;
+    let d = snapshot.parent().unwrap();
     std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
-    dev.write_config(blob)?;
-    save(&p, blob).context(
+    ensure!(
+        dev.status()?.token_b == p.device_crc,
+        "the device's config changed since the changes were worked out; read it again"
+    );
+    match &p.store {
+        None => dev.write_config(&p.native)?,
+        Some((revision, archive)) => dev.store_save(*revision, &[&p.native[..], archive].concat(), &mut |_| {})?,
+    }
+    save(&snapshot, &p.native).context(
         "the device was updated, but its local snapshot was not saved: \
          bnk8 will report the config as unknown until the next apply or reset",
     )

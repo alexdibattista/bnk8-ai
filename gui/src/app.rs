@@ -13,7 +13,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Fill, Font, Length, Task, Theme};
 
-use bnk8::config::{self, Blob, Changes, Config, FACTORY, KEY_SLOTS, KNOB_SLOTS, Key, Layer, Slots};
+use bnk8::config::{self, Blob, Changes, Config, FACTORY, KEY_SLOTS, KNOB_SLOTS, Key, Layer, Slots, StudioIds};
 use bnk8::presets::{self, Preset};
 use bnk8::store::{self, Current, Source};
 use bnk8::{actions, transport};
@@ -62,14 +62,17 @@ struct Connected {
     /// snapshot, the factory config or the profile store's copy).
     config: Option<Box<Blob>>,
     source: String,
-    /// Binepad Studio's layer names, when the config was read from its profile store.
+    /// The device has a profile store slot, so writes keep layer names.
+    store: bool,
+    /// The loaded layer names, by index (profile store only).
     layer_names: Vec<Option<String>>,
 }
 
 /// What reading the device found.
 #[derive(Clone, Debug)]
 pub enum Read {
-    Known { blob: Box<Blob>, cfg: Config, source: String, layer_names: Vec<Option<String>> },
+    /// `cfg` carries the profile store's layer names when `store`.
+    Known { blob: Box<Blob>, cfg: Config, source: String, store: bool },
     Unknown { crc: u32 },
 }
 
@@ -81,8 +84,9 @@ pub enum Read {
 pub enum Done {
     Devices(Vec<Device>),
     Loaded { serial: String, read: Read },
-    /// `edits` is the editor's config when the write started.
-    Written { blob: Box<Blob>, changes: usize, edits: Config },
+    /// `edits` is the editor's config when the write started; `blob` is what
+    /// was written (`None` when the device already had it).
+    Written { blob: Option<Box<Blob>>, changes: usize, edits: Config, store: bool },
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -90,7 +94,7 @@ type Job = Box<dyn FnOnce() + Send>;
 /// Validation and diff of the edited config, recomputed when it changes.
 enum Preview {
     Invalid(String),
-    Ready { blob: Box<Blob>, changes: Changes },
+    Ready { changes: Changes },
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -236,8 +240,6 @@ pub struct App {
     control: Control,
     tab: Tab,
     macro_slot: usize,
-    /// Binepad Studio's names of the edited layers, by index; empty when unknown.
-    layer_names: Vec<Option<String>>,
     preview: Preview,
     preview_of: Option<Config>,
     /// Label of the running device job, if any.
@@ -271,7 +273,6 @@ impl App {
             control: Control::Key(0),
             tab: Tab::Keys,
             macro_slot: 0,
-            layer_names: Vec::new(),
             preview: Preview::Invalid(String::new()),
             preview_of: None,
             busy: None,
@@ -334,14 +335,15 @@ impl App {
             let read = match store::current(&dev)? {
                 Current::Known(blob, source) => {
                     // Decoded here, so a config bnk8 can't model is an error, not a panic.
-                    let cfg = config::from_blob(&blob).context("decoding the device's config")?;
-                    let (source, layer_names) = match source {
-                        Source::Factory => ("factory default".into(), Vec::new()),
-                        Source::OlderFactory(version) => (format!("factory default (firmware {version})"), Vec::new()),
-                        Source::Snapshot => ("last written by bnk8".into(), Vec::new()),
-                        Source::ProfileStore { layer_names } => ("saved by Binepad Studio".into(), layer_names),
+                    let cfg = store::config(&blob, &source).context("decoding the device's config")?;
+                    let store = matches!(source, Source::ProfileStore { .. });
+                    let source = match source {
+                        Source::Factory => "factory default".into(),
+                        Source::OlderFactory(version) => format!("factory default (firmware {version})"),
+                        Source::Snapshot => "last written by bnk8".into(),
+                        Source::ProfileStore { .. } => "the device's profile store".into(),
                     };
-                    Read::Known { blob, cfg, source, layer_names }
+                    Read::Known { blob, cfg, source, store }
                 }
                 Current::Unknown { crc } => Read::Unknown { crc },
             };
@@ -349,13 +351,23 @@ impl App {
         })
     }
 
-    fn write(&mut self, blob: Box<Blob>, changes: usize) -> Task<Message> {
+    /// Writes `cfg`, through the device's profile store when it has one.
+    fn write(&mut self, cfg: Config) -> Task<Message> {
         let Some(serial) = self.target().map(|c| c.serial.clone()) else { return Task::none() };
-        let edits = self.cfg.clone();
         self.spawn("Writing to device", move || {
             let dev = transport::open(Some(&serial))?;
-            store::write(&dev, &blob)?;
-            Ok(Done::Written { blob, changes, edits })
+            let p = store::prepare(&dev, &cfg)?;
+            let changes = match &p.changes {
+                Changes::Items(lines) => lines.len(),
+                Changes::Unknown => config::flatten(&cfg).len(),
+            };
+            let blob = if p.unchanged() {
+                None
+            } else {
+                store::commit(&dev, &p)?;
+                Some(Box::new(p.native))
+            };
+            Ok(Done::Written { blob, changes, edits: cfg, store: p.saves_to_profile_store() })
         })
     }
 
@@ -377,40 +389,54 @@ impl App {
                 }
             }
             Ok(Done::Loaded { serial, read }) => {
-                let (blob, cfg, source, layer_names) = match read {
-                    Read::Known { blob, cfg, source, layer_names } => {
+                let (blob, cfg, source, store) = match read {
+                    Read::Known { blob, cfg, source, store } => {
                         self.info(format!("Loaded {serial} ({source})"));
-                        (Some(blob), cfg, source, layer_names)
+                        (Some(blob), cfg, source, store)
                     }
                     Read::Unknown { crc } => {
                         self.error(format!(
                             "This device's config (CRC {crc:#010x}) can't be identified: it isn't bnk8's last write, \
-                             the factory config, or the copy Studio stores on the device. Editing starts from the \
+                             the factory config, or the copy saved on the device. Editing starts from the \
                              factory defaults; Apply writes the whole config."
                         ));
                         let cfg = config::from_blob(FACTORY).expect("factory config decodes");
-                        (None, cfg, "unknown".into(), Vec::new())
+                        (None, cfg, "unknown".into(), false)
                     }
                 };
+                let layer_names = cfg.layers.iter().map(|l| l.name.clone()).collect();
                 self.cfg = cfg;
                 self.clamp_layer();
-                self.layer_names = layer_names.clone();
-                self.connected = Some(Connected { serial, config: blob, source, layer_names });
+                self.connected = Some(Connected { serial, config: blob, source, store, layer_names });
             }
-            Ok(Done::Written { blob, changes, edits }) => {
-                // The written blob is the new diff base. Edits made while it was
+            Ok(Done::Written { blob, changes, edits, store }) => {
+                let Some(blob) = blob else {
+                    self.info("The device already has this config");
+                    return Task::none();
+                };
+                // Names written: the edits' own, else the loaded ones (prepare keeps those).
+                let loaded = self.connected.as_ref().map_or_else(Vec::new, |c| c.layer_names.clone());
+                let layer_names: Vec<Option<String>> = if store {
+                    edits.layers.iter().enumerate().map(|(i, l)| l.name.clone().or(loaded.get(i).cloned().flatten())).collect()
+                } else {
+                    Vec::new()
+                };
+                // The written config is the new diff base. Edits made while it was
                 // being written stay pending against it; otherwise the editor
                 // shows what the device now holds (the factory config after a reset).
                 if self.cfg == edits {
-                    self.cfg = config::from_blob(&blob).expect("written blob decodes");
+                    let mut cfg = config::from_blob(&blob).expect("written blob decodes");
+                    for (l, n) in cfg.layers.iter_mut().zip(&layer_names) {
+                        l.name.clone_from(n);
+                    }
+                    self.cfg = cfg;
                     self.clamp_layer();
                 }
-                // Studio's stored copy, and with it its layer names, no longer matches the device.
-                self.layer_names.clear();
                 if let Some(c) = &mut self.connected {
                     c.config = Some(blob);
-                    c.source = "last written by bnk8".into();
-                    c.layer_names.clear();
+                    c.source = if store { "the device's profile store" } else { "last written by bnk8" }.into();
+                    c.store = store;
+                    c.layer_names = layer_names;
                 }
                 self.info(format!("Saved {changes} change(s) to the device"));
             }
@@ -422,9 +448,9 @@ impl App {
         self.connected.as_ref().and_then(|c| c.config.as_deref()).unwrap_or(FACTORY)
     }
 
-    /// `Layer N`, plus Binepad Studio's name for it when known.
+    /// `Layer N`, plus its name when it has one.
     fn layer_title(&self, i: usize) -> String {
-        match self.layer_names.get(i).and_then(Option::as_deref) {
+        match self.cfg.layers.get(i).and_then(|l| l.name.as_deref()) {
             Some(name) => format!("Layer {i} · {name}"),
             None => format!("Layer {i}"),
         }
@@ -436,29 +462,50 @@ impl App {
         self.connected.as_ref().filter(|c| self.serial.as_deref() == Some(c.serial.as_str()))
     }
 
+    /// What writing `blob` (the edited config) changes, per item; on devices
+    /// with a profile store, layer names count too (an unnamed layer keeps its name).
+    fn changes(&self, blob: &Blob) -> Result<Changes> {
+        let Some(c) = self.connected.as_ref() else { return config::changes(None, blob) };
+        let Some(before) = c.config.as_deref() else { return config::changes(None, blob) };
+        if !c.store {
+            return config::changes(Some(before), blob);
+        }
+        let named = |b: &Blob, names: &[Option<String>]| -> Result<Config> {
+            let mut cfg = config::from_blob(b)?;
+            for (l, n) in cfg.layers.iter_mut().zip(names) {
+                l.name.clone_from(n);
+            }
+            Ok(cfg)
+        };
+        let names: Vec<Option<String>> = (self.cfg.layers.iter().enumerate())
+            .map(|(i, l)| l.name.clone().or(c.layer_names.get(i).cloned().flatten()))
+            .collect();
+        let mut lines = config::diff(&named(before, &c.layer_names)?, &named(blob, &names)?);
+        if lines.is_empty() && blob != before {
+            lines.push("action table: reordered, bindings unchanged".into());
+        }
+        Ok(Changes::Items(lines))
+    }
+
     fn refresh_preview(&mut self) {
         if self.preview_of.as_ref() == Some(&self.cfg) {
             return;
         }
-        let before = self.connected.as_ref().and_then(|c| c.config.as_deref());
-        self.preview = match config::to_blob(&self.cfg, self.base()).and_then(|b| {
-            let changes = config::changes(before, &b)?;
-            Ok((b, changes))
-        }) {
-            Ok((blob, changes)) => Preview::Ready { blob: Box::new(blob), changes },
+        let result = config::to_blob(&self.cfg, self.base(), &StudioIds::new()).and_then(|b| self.changes(&b));
+        self.preview = match result {
+            Ok(changes) => Preview::Ready { changes },
             Err(e) => Preview::Invalid(format!("{e:#}")),
         };
         self.preview_of = Some(self.cfg.clone());
     }
 
     /// Number of changes Apply would write, when it can write.
-    fn pending(&self) -> Option<(&Blob, usize)> {
-        let Preview::Ready { blob, changes } = &self.preview else { return None };
-        let count = match changes {
+    fn pending(&self) -> Option<usize> {
+        let Preview::Ready { changes } = &self.preview else { return None };
+        Some(match changes {
             Changes::Unknown => config::flatten(&self.cfg).len(),
             Changes::Items(lines) => lines.len(),
-        };
-        Some((blob, count))
+        })
     }
 
     fn clamp_layer(&mut self) {
@@ -489,15 +536,14 @@ impl App {
             Message::AddLayer if self.cfg.layers.len() < actions::MAX_LAYERS => {
                 let knob = Slots { hold: Some("layer.next".into()), ..Slots::default() };
                 let lighting = self.cfg.layers[self.layer].lighting.clone();
-                self.cfg.layers.push(Layer { keys: vec![Key::Tap("none".into()); config::KEYS], knob, lighting });
-                self.layer_names.push(None);
+                let layer = Layer { name: None, keys: vec![Key::Tap("none".into()); config::KEYS], knob, lighting };
+                self.cfg.layers.push(layer);
                 self.layer = self.cfg.layers.len() - 1;
             }
             Message::AddPreset(preset) => {
                 let lighting = self.cfg.layers[self.layer].lighting.clone();
                 match presets::add(&mut self.cfg, preset, &lighting) {
                     Ok(i) => {
-                        self.layer_names.push(None);
                         self.layer = i;
                         self.tab = Tab::Keys;
                         self.control = Control::Key(0);
@@ -511,9 +557,6 @@ impl App {
             Message::RemoveLayer if self.cfg.layers.len() > 1 => {
                 let removed = self.layer;
                 self.cfg.layers.remove(removed);
-                if removed < self.layer_names.len() {
-                    self.layer_names.remove(removed);
-                }
                 let cleared = renumber_layer_refs(&mut self.cfg, removed);
                 self.clamp_layer();
                 if cleared > 0 {
@@ -619,14 +662,18 @@ impl App {
             Message::Hold(ms) => self.cfg.timing.hold_ms = ms,
             Message::ToggleChanges => self.show_changes = !self.show_changes,
             Message::Apply if idle && self.target().is_some() => {
-                if let Some((blob, n)) = self.pending().filter(|(_, n)| *n > 0) {
-                    let blob = Box::new(*blob);
-                    return self.write(blob, n);
+                if self.pending().is_some_and(|n| n > 0) {
+                    return self.write(self.cfg.clone());
                 }
             }
             Message::Discard if idle => {
-                self.cfg = config::from_blob(self.base()).expect("base decodes");
-                self.layer_names = self.connected.as_ref().map_or_else(Vec::new, |c| c.layer_names.clone());
+                let mut cfg = config::from_blob(self.base()).expect("base decodes");
+                if let Some(c) = &self.connected {
+                    for (l, n) in cfg.layers.iter_mut().zip(&c.layer_names) {
+                        l.name.clone_from(n);
+                    }
+                }
+                self.cfg = cfg;
                 self.clamp_layer();
             }
             Message::Import => {
@@ -647,7 +694,7 @@ impl App {
             Message::ConfirmReset => {
                 self.confirm_reset = false;
                 if idle && self.target().is_some() {
-                    return self.write(Box::new(*FACTORY), 1);
+                    return self.write(config::from_blob(FACTORY).expect("factory config decodes"));
                 }
             }
             Message::CancelReset => self.confirm_reset = false,
@@ -680,11 +727,10 @@ impl App {
         let result = std::fs::read_to_string(&path)
             .context("reading")
             .and_then(|t| config::from_toml(&t))
-            .and_then(|c| config::to_blob(&c, FACTORY).map(|_| c));
+            .and_then(|c| config::to_blob(&c, FACTORY, &StudioIds::new()).map(|_| c));
         match result {
             Ok(c) => {
                 self.cfg = c;
-                self.layer_names.clear();
                 self.clamp_layer();
                 self.info(format!("Imported {} (not yet applied)", path.display()));
             }
@@ -1193,7 +1239,7 @@ impl App {
             (true, false) => (Tone::Danger, "Selected device not loaded: press Load from device".into()),
             (true, true) => (tone, summary),
         };
-        let can_apply = idle && target && self.pending().is_some_and(|(_, n)| n > 0);
+        let can_apply = idle && target && self.pending().is_some_and(|n| n > 0);
         let toggle = (!lines.is_empty()).then(|| {
             button(text(if self.show_changes { "Hide changes" } else { "Show changes" }).size(12))
                 .style(style::icon)

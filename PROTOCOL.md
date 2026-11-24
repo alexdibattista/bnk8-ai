@@ -91,10 +91,19 @@ Session state lives in a 0x8E0-byte struct: active flag, timestamps,
 tokenA copy, expected CRC32, declared size, session id, then the
 2000-byte buffer at `+0x16` and a 250-byte chunk bitmap at `+0x7E6`.
 
-**Gate:** begins (sub 0/3/4) are NAK 3 while the `0x15` stream manager
-is not idle. Verified: with stream state 8, all begins NAK 3; after
-`0x15` sub 4 reset to state 2, sub 0 begin succeeds. Always check
-`0x15` sub 0 status first and reset if `state != 2`.
+**Gate** (`0x08007b22`–`0x08007b76`, msgs `0x11`/`0x12` only): normal
+dispatch requires the `0x15` stream manager to be idle with no
+activation running **and no valid profile-store slot** (revision 0).
+Otherwise the device is in restricted mode: only a sub-4 begin, and
+sub 1/2 plus `0x12` on an open sub-4 session, are accepted; every
+sub 0/3 begin is NAK 3. Verified: with stream state 8, all begins NAK 3;
+after `0x15` sub 4 reset to state 2, sub 0 begin succeeds (slot
+invalid). `[LIVE 2026-11-24: on a Studio-saved device (phase 2,
+revision 4) sub 0 is NAK 3 across power cycles while sub 4 is ACKed.]`
+The slot is in flash, so the restriction survives power cycles
+`[INFERENCE: no HID command short of 0x42 removes it]`. Always check `0x15` sub 0
+status first: reset if `state != 2`, and don't attempt sub 0/3 while
+`revision != 0`.
 
 - **sub 0** (begin fresh) / **sub 3** (begin modify), len 11:
   `[sub][tokenA u32][size u16=2000][crc32 u32]`.
@@ -109,15 +118,18 @@ is not idle. Verified: with stream state 8, all begins NAK 3; after
   are set per byte. Reply len 0 (ACK). `[LIVE: 134 chunks accepted]`
 - **sub 2** (abort), len 5: `[2][session_id u32]`. Clears session. ACK.
 - **sub 4** (begin RAM-only "apply/preview" session), len 15:
-  `[4][tokenA u32][tokenB u32][size u16=2000][crc32 u32]`.
-  Requires no active session, both channel-state checks, and the
-  **stream token ≠ 0** (a valid `0x15` stream slot must exist).
+  `[4][tokenA u32][size u16=2000][crc32 u32][tokenB u32]`
+  (`0x080072c0`–`0x080072ee`). Requires no active session, no held
+  keys, and the **stream token ≠ 0** (a valid `0x15` stream slot must
+  exist).
   Preloads the buffer with the current config, marks the bitmap full,
   replies `[session_id u32]`. A subsequent `0x12` commit on this session
   applies the buffer to the active config in RAM **without writing
   flash** (see below). This is the safe way to test a config — and the
   only write path that cannot destroy the stored config.
-  `[BLOCKED on the test unit: stream slot invalid — see 0x15 finalize blocker]`
+  `[LIVE 2026-11-24: begin ACKed with a session id on a Studio-saved
+  device; not committed]`
+- Sessions expire after 2.5 s without traffic (`0x08007cbe`–`0x08007cdc`).
 
 ### `0x12` commit — len 4
 `[session_id u32]`. Validates: session token, complete chunk bitmap,
@@ -156,21 +168,26 @@ store holding `[2000-byte native config][profile archive]`; Studio saves
 through it (the firmware activates the native part after the save) and
 reads layouts back from it.
 
-Two 0x2000-byte slots at flash `0x08018020`, each with a 0x20-byte
-`"BPP1"` header (magic, revision, 2000, archive length, CRC32, header
-CRC). Archive length `∈ [0x30, 0x1810]`; total stream = 2000 + archive
-length, so a slot is `[2000-byte native config][archive]`.
+Two 0x2000-byte A/B slots at flash `0x08018000` / `0x0801A000`, each a
+0x20-byte `"BPP1"` header (magic, revision, 2000, archive length, CRC32,
+header CRC) at the slot base, then the data at +0x20. Archive length
+`∈ [0x30, 0x1810]`; total stream = 2000 + archive length, so a slot's data
+is `[2000-byte native config][archive]`. A save goes to the other slot; the
+old one is never erased, and the active slot switches only at the end of
+Confirm. While any `0x11` session is open, every `0x15` message is NAK 3.
 
 **Phases** (byte 1 of the status reply): 0 ScanHeader, 1 ScanBody,
 **2 Idle**, 3 Erase, 4 Receive, 5 Verify, 6 Publish, 7 Confirm,
-8 Failed, 9 ScanEmpty, 10 Activating, 11 ActivationFailed.
+8 Failed, 9 ScanEmpty, 10 Activating, 11 ActivationFailed. Phase 10 is
+reported while the applied revision differs from the active one.
 
 **Archive** (after the native config): a 48-byte header — `"BPP1"`,
 version `1` (u32), JSON length (i32), compressed length (i32), SHA-256
 of the JSON — then the Brotli-compressed JSON
 `{format: 1, deviceId, profile}`, where `profile` is Studio's device
 profile (layer names, application bindings, per-key colours). `"BPP2"`
-is a delta format Studio uses for incremental saves.
+is a delta format Studio uses for incremental saves (BNK16 only). The
+firmware checks only the archive's length; Studio decodes the whole archive.
 
 - **sub 5** (device ID), len 1: `[05]`. Reply len 22:
   `[03][serial_hash u32][UID 12][d0 07][10 18][01]` — the 12-byte STM32
@@ -180,8 +197,9 @@ is a delta format Studio uses for incremental saves.
   `[02][phase][revision u32][native len u16][archive len u16]
   [capacity u16][received u16][pending archive len u16]
   [payload CRC32 u32][00 00]`. The payload CRC covers native + archive.
-  Revision 0 = no valid slot. `[LIVE: phase 2, revision 4, archive 912
-  on a Studio-saved device]`
+  Bytes 14..19 describe the active slot when idle and the save's target
+  slot in phases 3–7. Revision 0 = no valid slot. `[LIVE: phase 2,
+  revision 4, archive 912 on a Studio-saved device]`
 - **sub 1** (read), len 8: `[1][revision u32][offset u16][count u8]`,
   count 1..0x16, offsets over native + archive. Requires phase 2, a
   valid slot and a revision match. Reply len = count with the requested
@@ -190,39 +208,49 @@ is a delta format Studio uses for incremental saves.
   0x10 token B]`
 - **sub 2** (begin save), len 11:
   `[2][expected revision u32][archive len u16][payload CRC32 u32]`;
-  archive length in `[0x30, 0x1810]`; the revision must equal the
-  current one (0 when no valid slot) and not be `0xFFFFFFFF`. New
-  revision = old + 1. Phase 2 → 3. `[LIVE: accepted, phase 3 → 4]`
+  archive length in `[0x30, 0x1810]` (else NAK 2); phase must be 2 (NAK 3,
+  or NAK 6 in phase 8); the revision must equal the active one (0 when no
+  valid slot) and not be `0xFFFFFFFF` (NAK 4). New revision = old + 1.
+  Replies with the status; phase 2 → 3 → 4.
 - **sub 8** (keep blocks), len 5: `[8][start u16][len u16]`; both
-  64-aligned; phase 4. Copies unchanged 64-byte blocks from the previous
-  revision (the manager prefills staging from flash and writes it
-  back); not needed for an all-data write.
-- **sub 3** (write data), len 4..19: `[3][offset u16][≤ 16 bytes]` into
+  64-aligned, `start` = received count, phase 4. Copies unchanged 64-byte
+  blocks from the old slot; optional, a full-data write is valid.
+- **sub 3** (write data), len 4..19: `[3][offset u16][1..16 bytes]` into
   a 0x40-byte staging buffer, never crossing a 64-byte boundary;
-  `offset` must equal the running received count; phase 4 (also
-  accepted in 8). A background task (`FUN_08002D24`) programs 0x40-byte
-  blocks to flash and drives the phases (2→3→4→5→7→2, or →8 on error).
-  Studio then polls status until Idle with `revision + 1`.
-  `[LIVE: 2048/2048 bytes accepted, phase 4 → 5]`
-- **sub 4** (cancel/rescan), len 5: `[4][revision u32]`; phase 3..6 → 2,
-  phase 7/8 → full reset (memsets the stream session, marks slots
-  invalid). Studio sends it once when the phase is Failed.
+  `offset` must equal the received count (NAK 4); phase 4 only (NAK 6 in
+  phase 8, NAK 3 otherwise or while the staging buffer flushes). Replies
+  with the status. The manager (`FUN_08002D24`) flushes full blocks and
+  the padded last one, then drives 4 → 5 (Verify: re-reads the slot,
+  checks the payload CRC and runs `FUN_080029c0`, the `0x12` structural
+  check, on the native part) → 6 (Publish header) → 7 (Confirm: header
+  and `BPOW` directory record) → 2, or → 8 on any failure. Phases 3 and 4
+  advance only while no key has been pressed for 39 ms. There is no
+  firmware timeout: an abandoned save stays open until sub 4 or a reboot.
+- **Activation**: once the new slot is active, the device applies its
+  native config (same checks again), sets token A = revision and token B
+  = native CRC, and reports phase 2. It waits for no key activity, and
+  runs again at every boot, so the store's config wins over the legacy
+  config record. Failure → phase 11, cleared only by a power cycle.
+- **sub 4** (cancel/rescan), len 5: `[4][active revision u32]` (NAK 4
+  otherwise); phase 3..6 → 2; phase 7/8 → clears the store's RAM state
+  and rescans flash, which picks the highest valid revision (nothing in
+  flash is invalidated). Studio sends it once when the phase is Failed.
   `[LIVE: recovers phase 8 → 2]`
 
-**Finalize blocker `[BLOCKED on the test unit]`:** after all data is
-accepted (phase 5, Verify), the manager writes the 0x20 `"BPP1"` slot
-header, then a 0x10-byte `"BPOW"` directory record to flash page
-`0x0801C000`, then validates readback. On the test unit the transition
-5 → 8 (Verify → Failed) is deterministic. The flash writer
-(`FUN_08002B68`) refuses any 0 → 1 bit transition (`src & ~dst == 0`
-per byte), so one suspect is a `0x0801C000` page that holds unexpected
-data and is **not** coverable by any protocol erase (the stream erase
-spans only `[slot_base, slot_base+0x2000)`; the directory lies exactly
-one past the end). Another `[INFERENCE]`: the firmware checks the
-archive header during Verify, and the test payload had no valid `BPP1`
-archive. Studio saves through this store successfully, so the store
-itself works. Boot recovery paths exist (`+0x84` sentinels
-`0xFFFF`/`0xFFFE`) but require the same page to be blank/valid first.
+**Save sequence `[LIVE 2026-11-24, fw 6.0.25, bnk8 `store_save`]`:**
+wait for phase 2 (sub 4 once from Failed); sub 2 with the active revision;
+while phase 4 and received < total, send sub 3 with
+`min(16, total − received, 64 − received % 64)` bytes at the received
+count (retry on NAK 3/4 after re-reading the status); poll status every
+10 ms until phase 2 with revision + 1 and the payload's archive length and
+CRC; then token B = native CRC. A 2912-byte save took about 0.4 s
+(3 → 4 at 16 ms, 4 → 5 at 381 ms, 5 → 2 at 402 ms); bnk8's saves of
+revisions 5–9 all read back identical, and revision 8 survived a power cycle.
+
+**The old finalize blocker** (2026-11-17, Verify → Failed): that probe
+streamed 2048 zero bytes, whose native part fails `FUN_080029c0` (no
+`BPN8` magic), so Verify failed deterministically; the directory page was
+not involved.
 
 ### `0x22` retired — always NAK 8.
 
@@ -441,38 +469,42 @@ funnels through five call sites; the complete set of host-visible reads:
 
 The 2000-byte active config (keymap, macros, RGB) has no direct read
 command. The `0x11` sub-4 session preloads it into the session buffer
-but offers no read-out. bnk8's own saves through the `0x15` store fail
-on the test unit (see the `0x15` finalize blocker), but Binepad Studio
-saves through it successfully.
+but offers no read-out.
 
-Whenever Binepad Studio saved last, the `0x15` profile store holds a
-readable copy of the native config: status phase 2 (Idle), revision
-≠ 0, native length 2000, and the first 2000 bytes read with sub 1 have
-the CRC of `0x10` token B. `[LIVE]` bnk8 reads the active config back
-from there when its own snapshot and the factory config don't match.
+Whenever the `0x15` profile store has a slot (Binepad Studio or bnk8 saved
+last), it holds a readable copy of the native config: status phase 2
+(Idle), revision ≠ 0, native length 2000, and the first 2000 bytes read
+with sub 1 have the CRC of `0x10` token B. `[LIVE]` bnk8 reads the active
+config back from there first.
 
 **What bnk8 does:** `0x10` token B is the CRC-32 of the active
 config (`[LIVE]`: factory blob CRC `0xCA2BFF5F` = token B before and
 after the factory write). bnk8 stores every blob it writes at
 `$XDG_STATE_HOME/bnk8/<serial>.bin` (default `~/.local/state/bnk8/`).
-`dump`, `set` and the `apply` diff use that snapshot, the embedded
-factory blob, the factory configs of firmware 6.0.19/21/24 (the same
-blob with other layer colours, recognised by CRC), or the profile
-store's copy — each only when its CRC
-equals token B, i.e. it is provably the device's config. A config that
-matches none of them is reported as unknown; `apply` then writes the
-whole file over the factory base, and `reset` restores the factory
-blob.
+`dump`, `set` and the `apply` diff use the profile store's copy, that
+snapshot, the embedded factory blob, or the factory configs of firmware
+6.0.19/21/24 (the same blob with other layer colours, recognised by CRC) —
+each only when its CRC equals token B, i.e. it is provably the device's
+config. A config that matches none of them is reported as unknown;
+`apply` then writes the whole file over the factory base, and `reset`
+restores the factory blob.
 
 Writes are whole-blob: there is no per-item write command, so
 `apply`/`set` print per-item diffs but always persist all 2000 bytes.
+While the profile store holds a valid slot (revision ≠ 0), the firmware
+refuses `0x11` sub-0 begins (see the `0x11` gate), so bnk8 saves through
+the store instead, with Binepad Studio's profile updated so that Studio's
+compiler (`Bnk8ProfileCodec.Compile`) produces exactly the native config
+written (`docs/STUDIO.md` §5). Devices without a slot are written with
+`0x11` sub 0.
 
 ## Firmware notes
 
-- SoC: Cortex-M, app at `0x08000000` (tested device reports fw 6.0.25,
+- SoC: Cortex-M, app at `0x08002000`; the `FUN_0800xxxx` addresses in this
+  file are image offsets + `0x08000000` (tested device reports fw 6.0.25,
   published image is 6.0.27; protocol identical on all verified
-  commands). Config page `0x0801E000`; stream slots `0x08018020` +
-  slot*0x2000; factory data page `0x0800B000+`.
+  commands). Config page `0x0801E000`; profile store slots `0x08018000` +
+  slot*0x2000 (data at +0x20); factory data page `0x0800B000+`.
 - Timer tick ≈ 1 ms (`FUN_0800334C`), used for all timeouts.
 - HID report descriptors in the data page match the observed interfaces
   (`0x0800B9CB`: `06 42 FF 09 49 …` = 32-byte raw HID).

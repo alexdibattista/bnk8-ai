@@ -116,13 +116,13 @@ Effect ids and names (byte 0): 0 Off, 1 Solid, 3 Gradient Up Down, 4 Gradient Le
 
 Factory images: Studio ships the current BNK8 AI factory config (CRC `0xCA2BFF5F`, the same as `assets/factory-config.bin`) and those of firmware 6.0.24 (`0xEBD4C372`), 6.0.21 (`0x9AC52986`), 6.0.19 (`0x0FB1AEA0`) and 6.0.18 (`0xE1F4F4CE`). They differ only in layer colours, except 6.0.18, which has no Media layer bindings. Like bnk8, Studio recognises a factory config by CRC.
 
-## 5. On-device profile store (`0x15`) — read-back
+## 5. On-device profile store (`0x15`) — read-back and saving
 
 Studio's `0x15` is **PortableProfile**: a flash store holding `[2000-byte native config][profile archive]`. Studio saves through it, and the firmware activates the native part after the save. It is also how Studio reads a layout back. [Protocol/…/UsbPortableStoreTransfer]
 
 - **Geometry (BNK8):** native 2000 bytes; archive capacity 6160 bytes (`0x1810`).
 - **Status (sub 0)**, reply 22 bytes: `[02][phase][revision u32][native len u16][archive len u16][capacity u16][received u16][pending archive len u16][payload CRC32 u32][00 00]`. The payload CRC covers native + archive.
-- **Phases:** 0 ScanHeader, 1 ScanBody, **2 Idle**, 3 Erase, 4 Receive, 5 Verify, 6 Publish, 7 Confirm, 8 Failed, 9 ScanEmpty, 10 Activating, 11 ActivationFailed. These are the "states" in `PROTOCOL.md`; its finalize blocker is Verify → Failed.
+- **Phases:** 0 ScanHeader, 1 ScanBody, **2 Idle**, 3 Erase, 4 Receive, 5 Verify, 6 Publish, 7 Confirm, 8 Failed, 9 ScanEmpty, 10 Activating, 11 ActivationFailed. These are the "states" in `PROTOCOL.md`.
 - **Read (sub 1):** `[01][revision u32][offset u16][count ≤ 22]`, offsets over native + archive.
 - **Save:**
   - sub 2 `[02][expected revision u32][archive len u16][payload CRC32 u32]` begins a save.
@@ -133,16 +133,24 @@ Studio's `0x15` is **PortableProfile**: a flash store holding `[2000-byte native
 - **Archive format:**
   - The archive begins with a 48-byte header: `"BPP1"`, version `1` (u32), JSON length (i32), compressed length (i32), then the SHA-256 of the JSON.
   - After the header comes the Brotli-compressed JSON `{format: 1, deviceId, profile}`. `profile` is Studio's DeviceProfile, which includes layer names, application bindings and per-key colours.
-  - `"BPP2"` is a delta format used for incremental saves.
+  - `"BPP2"` is a delta format; Studio writes it only for the BNK16 and saves BNK8 profiles as `BPP1`.
+  - `deviceId` is derived from the device, not the Studio install; bnk8 copies it from the previous archive.
 
 **Live check (read-only, this BNK8):**
 - Status shows phase Idle, revision 4, and an archive of 912 bytes.
 - Reading 2,912 bytes with sub 1 returned a native config with CRC `0xCA0AFB3A`. That equals the device's `0x10` token B, so it is exactly the active config.
 - The archive is valid `BPP1`. It decodes to Studio's profile, saved 2026-11-20 13:15 UTC: the factory layout with layer 0's colour changed to `#560000`.
 
-This is why `bnk8 info` reported the config as unknown: Studio had saved it.
+**The profile is Studio's source of truth.** Studio never decodes the native config; it reads the archive's profile and compiles it (`CompactProfileCodec.Compile` → `Bnk8ProfileCodec.Compile`). Its agent (`ProfileSynchronizationRuntime`, on start, on device changes and every 8 s after the store revision moves) compares the compiled image with the device's active config and re-saves the profile when the length or CRC differs (`DeviceCoordinator.EnsurePortablePlatformAsync`). A tool that saves through the store must therefore write a profile that compiles to exactly its native config. Studio's compiler:
 
-For `PROTOCOL.md`'s finalize blocker this suggests a lead `[INFERENCE]`: the firmware probably checks the archive header during Verify. A test that streamed a payload without a valid `BPP1` archive would then fail exactly as recorded.
+- starts from zeros, then writes `BPN8`, version 1, layer count, 9, 6, the action count, then the constants 15, 0, 180, u16 180, **u16 260, u16 350**: the profile has no timing, so timing is always 260/350 ms;
+- builds the action table from the distinct `(actionId, param, execution)` keys of all gestures, **sorted by action id (ordinal), then param**;
+- encodes each layer's lighting from zeros (`[effect][min(brightness,180)][speed][flags][rgb][0]` and `[1 r g b]` per listed key); with `sharedRgbAcrossLayers` every layer gets layer 0's lighting plus flag bit 2;
+- encodes on-device macros as `[event][FirmwareActionCode][(ms+5)/10]`.
+
+`ProfileValidator` additionally rejects actions on gestures their descriptor doesn't support (e.g. `layer.mo.N` only on Tap), `app.open`/`app.focus`/`system.app-volume` without an `applicationId` argument, and model/effort selectors (`claude.*.knob`, `codex.composer.*.knob`) that don't take the knob's press and both turns (`WholeKnobAssignment`, `CodexModelKnobAssignment`).
+
+**bnk8 saves the same way** (`src/store.rs`, `src/profile.rs`): it reads the slot, decodes the previous profile, rewrites the bindings, names, lighting and on-device macros from the TOML, keeps everything else, checks that Studio's compile of the new profile is bnk8's native config, and saves both with sub 2/3. Verified with Studio's own compiler and validator (a local harness over Studio's assemblies) on Studio's five factory profiles and on this device's archives, and live: Studio opened bnk8-written revision 6 without errors, and its agent left revisions 6–9 in place.
 
 ## 6. Messages Studio uses that `PROTOCOL.md` names differently
 
@@ -193,8 +201,8 @@ Key masks are bit-per-key; "lease" = 3 s. `PROTOCOL.md` reads `0x30` as RGB cont
 
 ## 8. Gaps in bnk8, most valuable first
 
-1. **Read-back through the profile store.** `info`, `dump` and the GUI could load the exact config Studio (or bnk8) saved, instead of "unknown". This was proven read-only on this device.
-2. **Show Studio's layer names and per-key colours** from the archive. Optionally write bnk8 configs back through the store so Studio stays in sync.
+1. **Read-back through the profile store.** Done: `info`, `dump`, the GUI and the MCP server read the store's copy first.
+2. **Layer names and writing through the store.** Done: layer names are a TOML field, and bnk8 saves through the store with Studio's profile kept in sync (§5).
 3. **Per-key colours** in the TOML and GUI (lighting bytes 8..39, flag bit 1) and the **shared lighting** flag (bit 2).
 4. **Name the remaining actions:**
    - `layer.mo.N`, `layer.tg.N`, `rgb.restore`, the `rgb.effect.*` presets and `keyboard.numpad.clear`.

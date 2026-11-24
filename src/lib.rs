@@ -7,6 +7,8 @@ pub mod config;
 pub mod frame;
 pub mod protocol;
 pub mod presets;
+pub mod profile;
 pub mod store;
 mod studio_ids;
+mod studio_gestures;
 pub mod transport;
