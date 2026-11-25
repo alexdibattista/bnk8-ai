@@ -453,7 +453,8 @@ fn decode_step(s: [u8; 4]) -> Vec<String> {
     out
 }
 
-fn encode_steps(steps: &[String]) -> Result<Vec<[u8; 4]>> {
+/// Validates and encodes one macro's steps (at most [`MACRO_STEPS`] key steps).
+pub fn encode_steps(steps: &[String]) -> Result<Vec<[u8; 4]>> {
     let mut out = Vec::new();
     let mut delay: u32 = 0;
     for (i, step) in steps.iter().enumerate() {

@@ -412,6 +412,8 @@ dependencies = [
  "hidapi",
  "iced",
  "rfd",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

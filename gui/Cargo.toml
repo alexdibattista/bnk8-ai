@@ -10,3 +10,5 @@ bnk8 = { version = "0.3.2", path = ".." }
 hidapi = "2.6.7"
 iced = "0.14"
 rfd = "0.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

@@ -18,6 +18,7 @@ use bnk8::presets::{self, Preset};
 use bnk8::store::{self, Current, Source};
 use bnk8::{actions, transport};
 
+use crate::assistant::{self, Answer, Login};
 use crate::style::{self, BOLD, SEMIBOLD, Tone};
 use crate::widgets::{Catalog, action_picker, key_picker, macro_summary, pretty, short, tip};
 
@@ -66,6 +67,14 @@ struct Connected {
     store: bool,
     /// The loaded layer names, by index (profile store only).
     layer_names: Vec<Option<String>>,
+}
+
+/// The Macros tab's "Ask Claude" panel.
+struct Ai {
+    login: Login,
+    prompt: String,
+    asking: bool,
+    answer: Option<Result<Answer, String>>,
 }
 
 /// What reading the device found.
@@ -198,6 +207,18 @@ pub enum StepEdit {
 }
 
 #[derive(Clone, Debug)]
+pub enum AiEvent {
+    Check,
+    Checked(Result<Login, String>),
+    SignIn,
+    Prompt(String),
+    Ask,
+    Answered(Result<Answer, String>),
+    Accept,
+    Dismiss,
+}
+
+#[derive(Clone, Debug)]
 pub enum Message {
     Finished(Result<Done, String>),
     RefreshDevices,
@@ -229,6 +250,7 @@ pub enum Message {
     AskReset,
     ConfirmReset,
     CancelReset,
+    Ai(AiEvent),
 }
 
 pub struct App {
@@ -251,6 +273,7 @@ pub struct App {
     catalog: Catalog,
     /// Layer templates, as pick-list options.
     templates: Vec<&'static Preset>,
+    ai: Ai,
 }
 
 impl App {
@@ -282,6 +305,7 @@ impl App {
             confirm_reset: false,
             catalog: Catalog::new(),
             templates: presets::PRESETS.iter().collect(),
+            ai: Ai { login: Login::Unchecked, prompt: String::new(), asking: false, answer: None },
         };
         let task = app.refresh_devices();
         app.refresh_preview();
@@ -524,11 +548,18 @@ impl App {
         let idle = self.busy.is_none();
         match message {
             Message::Finished(result) => return self.finished(result),
+            Message::Ai(e) => return self.ai_event(e),
             Message::RefreshDevices if idle => return self.refresh_devices(),
             Message::SelectDevice(d) => self.serial = Some(d.serial),
             Message::Load if idle && self.serial.is_some() => return self.load(),
             Message::DismissBanner => self.message = None,
-            Message::SelectTab(tab) => self.tab = tab,
+            Message::SelectTab(tab) => {
+                self.tab = tab;
+                // Looked up lazily: users who never open Macros never run `claude`.
+                if tab == Tab::Macros && matches!(self.ai.login, Login::Unchecked) {
+                    return self.ai_event(AiEvent::Check);
+                }
+            }
             Message::SelectLayer(i) if i < self.cfg.layers.len() => {
                 self.layer = i;
                 self.tab = Tab::Keys;
@@ -721,6 +752,71 @@ impl App {
         if !steps.is_empty() {
             self.cfg.macros.insert(key, steps);
         }
+    }
+
+    /// The "Ask Claude" panel. Claude Code runs on threads of its own, never
+    /// the HID worker: its calls take seconds.
+    fn ai_event(&mut self, e: AiEvent) -> Task<Message> {
+        match e {
+            // Allowed while signing in, so a sign-in finished in Terminal shows up.
+            AiEvent::Check if !matches!(self.ai.login, Login::Checking) => {
+                self.ai.login = Login::Checking;
+                return Task::perform(assistant::background(assistant::check), |r| Message::Ai(AiEvent::Checked(r)));
+            }
+            AiEvent::Check => {}
+            AiEvent::Checked(r) => self.ai.login = r.unwrap_or_else(Login::Failed),
+            AiEvent::SignIn => {
+                if let Login::SignedOut(path) = &self.ai.login {
+                    let path = path.clone();
+                    self.ai.login = Login::SigningIn;
+                    return Task::perform(assistant::background(move || assistant::sign_in(&path)), |r| {
+                        Message::Ai(AiEvent::Checked(r))
+                    });
+                }
+            }
+            AiEvent::Prompt(s) => self.ai.prompt = s,
+            AiEvent::Ask => {
+                let prompt = self.ai.prompt.trim().to_owned();
+                if let Login::SignedIn { claude, .. } = &self.ai.login
+                    && !self.ai.asking
+                    && !prompt.is_empty()
+                {
+                    let claude = claude.clone();
+                    let system = assistant::system_prompt(&self.cfg.macros, self.macro_slot);
+                    self.ai.asking = true;
+                    self.ai.answer = None;
+                    return Task::perform(assistant::background(move || assistant::ask(&claude, &system, &prompt)), |r| {
+                        Message::Ai(AiEvent::Answered(r))
+                    });
+                }
+            }
+            AiEvent::Answered(r) => {
+                self.ai.asking = false;
+                self.ai.answer = Some(r);
+            }
+            AiEvent::Accept => {
+                if let Some(Ok(a)) = &self.ai.answer
+                    && !a.macros.is_empty()
+                {
+                    for p in &a.macros {
+                        self.cfg.macros.insert(config::macro_key(p.slot), p.steps.clone());
+                    }
+                    self.macro_slot = a.macros[0].slot;
+                    let list = a
+                        .macros
+                        .iter()
+                        .map(|p| format!("Macro {} ({})", p.slot + 1, p.description))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.ai.answer = None;
+                    self.info(format!(
+                        "Added {list} from Claude (not yet applied). Bind it to a key on Keys & lighting, then Apply to device."
+                    ));
+                }
+            }
+            AiEvent::Dismiss => self.ai.answer = None,
+        }
+        Task::none()
     }
 
     fn import(&mut self, path: PathBuf) {
@@ -1116,6 +1212,7 @@ impl App {
                 "Macros".into(),
                 "Up to 15 macros of 7 key steps each. Bind one by picking Macro and its number in any key or knob slot."
             ),
+            self.ai_card(),
             row![
                 container(Column::with_children(list).spacing(2)).padding(8).width(230).style(style::card),
                 self.macro_editor(),
@@ -1194,6 +1291,114 @@ impl App {
             column![list, actions, hint("A delay (multiple of 10 ms, up to 2550 ms) waits before the next key step.")]
                 .spacing(14),
         )
+    }
+
+    /// "Ask Claude": sign-in state, the prompt, and Claude's proposed macros.
+    fn ai_card(&self) -> Element<'_, Message> {
+        let check = |enabled: bool| {
+            button(text("Check again").size(13))
+                .style(style::ghost)
+                .on_press_maybe(enabled.then_some(Message::Ai(AiEvent::Check)))
+        };
+        let body: Element<'_, Message> = match &self.ai.login {
+            Login::Unchecked | Login::Checking => hint("Looking for Claude Code…"),
+            Login::Missing => column![
+                text("Ask Claude needs Claude Code, signed in with your Claude account.").size(13),
+                hint("Install it from claude.com/claude-code, then press Check again."),
+                check(true),
+            ]
+            .spacing(10)
+            .into(),
+            Login::SignedOut(_) => column![
+                text("Sign in with your Claude account, then describe a macro in your own words.").size(13),
+                button(text("Sign in with Claude").size(13).font(BOLD))
+                    .style(style::primary)
+                    .padding([6, 16])
+                    .on_press(Message::Ai(AiEvent::SignIn)),
+                hint("Opens your browser. Sign-in goes through Claude Code; bnk8 never sees your password."),
+            ]
+            .spacing(10)
+            .into(),
+            Login::SigningIn => column![
+                text("Finish signing in in your browser…").size(13),
+                hint("No browser window? Run `claude auth login` in Terminal, then press Check again."),
+                check(true),
+            ]
+            .spacing(10)
+            .into(),
+            Login::Failed(e) => column![error_box(e), check(true)].spacing(10).into(),
+            Login::SignedIn { account, .. } => {
+                let asking = self.ai.asking;
+                let can_ask = !asking && !self.ai.prompt.trim().is_empty();
+                let status = row![
+                    status_pill(Tone::Success, format!("Signed in as {account}")),
+                    space::horizontal(),
+                    check(!asking),
+                ]
+                .align_y(Alignment::Center);
+                let ask = row![
+                    text_input("Describe a macro, e.g. Cmd+Shift+4 to capture part of the screen", &self.ai.prompt)
+                        .on_input(|s| Message::Ai(AiEvent::Prompt(s)))
+                        .on_submit(Message::Ai(AiEvent::Ask))
+                        .width(Fill)
+                        .style(style::input),
+                    button(text(if asking { "Asking…" } else { "Ask Claude" }).size(13).font(BOLD))
+                        .style(style::primary)
+                        .padding([6, 16])
+                        .on_press_maybe(can_ask.then_some(Message::Ai(AiEvent::Ask))),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center);
+                let answer: Option<Element<'_, Message>> = match &self.ai.answer {
+                    None => None,
+                    Some(Err(e)) => Some(error_box(e)),
+                    Some(Ok(a)) => Some(self.ai_answer(a)),
+                };
+                column![status, ask]
+                    .push(answer)
+                    .push(hint(
+                        "Claude's macros are added as edits; nothing is written until Apply to device. Uses your Claude subscription through Claude Code.",
+                    ))
+                    .spacing(12)
+                    .into()
+            }
+        };
+        card("Ask Claude".into(), body)
+    }
+
+    /// Claude's reply and proposed macros, with Add to macros / Dismiss.
+    fn ai_answer<'a>(&'a self, a: &'a Answer) -> Element<'a, Message> {
+        let proposals = a.macros.iter().map(|p| {
+            let replaces = self
+                .cfg
+                .macros
+                .get(&config::macro_key(p.slot))
+                .filter(|old| **old != p.steps)
+                .map(|old| text(format!("Replaces its current {} step(s).", key_steps(old))).size(12).style(style::muted));
+            let details = column![
+                text(&p.description).size(13),
+                text(p.steps.join(" · ")).size(12).font(Font::MONOSPACE).style(style::muted),
+            ]
+            .push(replaces)
+            .spacing(4);
+            row![text(format!("Macro {}", p.slot + 1)).font(SEMIBOLD).width(80), details].spacing(12).into()
+        });
+        let add = (!a.macros.is_empty()).then(|| {
+            button(text("Add to macros").size(13).font(BOLD))
+                .style(style::primary)
+                .padding([6, 16])
+                .on_press(Message::Ai(AiEvent::Accept))
+        });
+        let actions = row![]
+            .push(add)
+            .push(button(text("Dismiss").size(13)).style(style::ghost).on_press(Message::Ai(AiEvent::Dismiss)))
+            .spacing(8)
+            .align_y(Alignment::Center);
+        column![text(&a.reply).size(13)]
+            .push((!a.macros.is_empty()).then(|| Column::with_children(proposals).spacing(10)))
+            .push(actions)
+            .spacing(12)
+            .into()
     }
 
     fn timing_tab(&self) -> Element<'_, Message> {
@@ -1324,6 +1529,10 @@ fn section_label(label: &str) -> Element<'_, Message> {
 
 fn hint(body: &str) -> Element<'_, Message> {
     text(body).size(12).style(style::muted).into()
+}
+
+fn error_box(e: &str) -> Element<'_, Message> {
+    container(text(e).size(13)).padding([8, 12]).width(Fill).style(style::banner(Tone::Danger)).into()
 }
 
 fn card<'a>(title: String, body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {

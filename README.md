@@ -67,7 +67,7 @@ cargo run --release -p bnk8-gui
 Plug the BNK8 in first; the app finds and loads it on startup (press **Refresh** if you plug it in later).
 
 - **Keys & lighting**: click a key or the knob on the keypad, then choose what each gesture does (tap, double tap, hold, tap then hold; the knob also has turn left/right). Set the layer's effect, brightness, speed and colour, a colour per key, and whether every layer shares one lighting setup.
-- **Macros**: up to 15 macros of up to 7 key steps, with optional delays.
+- **Macros**: up to 15 macros of up to 7 key steps, with optional delays. **Ask Claude** writes macros from a description such as "Cmd+Shift+4 to capture part of the screen". It needs [Claude Code](https://claude.com/claude-code) and runs on your own Claude subscription: press **Sign in with Claude** (or run `claude auth login` in Terminal). Claude only proposes macros; you review them, **Add to macros** stages them as edits, and nothing reaches the device until **Apply to device**.
 - **Timing**: double-tap window and hold threshold.
 - **Layer templates**: **+ Add from template…** adds a ready-made layer for **Zoom** or **Google Meet** (macOS or Windows/Linux shortcuts). Shortcuts with modifier keys are stored as macros, so each template uses up to 6 free macro slots.
 - Edits stay local until you press **Apply to device**. The bottom bar shows how many changes are pending, and you can list them. **Import/Export TOML** uses the same format as the CLI.

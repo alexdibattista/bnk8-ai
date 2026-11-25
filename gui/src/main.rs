@@ -1,6 +1,7 @@
 //! Desktop configurator for the Binepad BNK8 AI Edition.
 
 mod app;
+mod assistant;
 mod style;
 mod widgets;
 
