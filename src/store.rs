@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::archive::{self, Document};
-use crate::config::{self, Blob, Changes, Config, FACTORY, OLDER_FACTORY, StudioIds, older_factory};
+use crate::config::{self, Blob, Changes, Config, FACTORY, Names, OLDER_FACTORY, StudioIds, older_factory};
 use crate::profile;
 use crate::protocol::{CONFIG_LEN, Nak, PHASE_IDLE, STREAM_SIZE_MAX, crc32};
 use crate::transport::Bnk8;
@@ -28,8 +28,8 @@ pub enum Source {
     /// The factory config of an older firmware version.
     OlderFactory(&'static str),
     /// Read back from the device's profile store (saved by Binepad Studio or
-    /// bnk8), with the layer names from its profile, one entry per layer.
-    ProfileStore { layer_names: Vec<Option<String>> },
+    /// bnk8), with the layer and macro names from its profile.
+    ProfileStore { names: Names },
 }
 
 /// The device's current config, if bnk8 can identify it.
@@ -109,15 +109,8 @@ pub fn current(dev: &Bnk8) -> Result<Current> {
         let native = slot.native();
         if crc32(&native) == crc {
             // Token B already proves the native config; names are best effort.
-            let mut layer_names = vec![None; native[5] as usize]; // byte 5: layer count
-            if let Ok(doc) = archive::decode(slot.archive()) {
-                for (i, name) in archive::layer_names(&doc.profile) {
-                    if let Some(n) = layer_names.get_mut(i) {
-                        *n = Some(name);
-                    }
-                }
-            }
-            return Ok(Current::Known(Box::new(native), Source::ProfileStore { layer_names }));
+            let names = archive::decode(slot.archive()).map(|doc| profile::names(&doc.profile)).unwrap_or_default();
+            return Ok(Current::Known(Box::new(native), Source::ProfileStore { names }));
         }
     }
     // Without a state directory there is no snapshot, but the factory check still applies.
@@ -137,13 +130,11 @@ pub fn current(dev: &Bnk8) -> Result<Current> {
     Ok(Current::Unknown { crc })
 }
 
-/// Decodes a known config, with the profile store's layer names.
+/// Decodes a known config, with the profile store's layer and macro names.
 pub fn config(blob: &Blob, source: &Source) -> Result<Config> {
     let mut cfg = config::from_blob(blob)?;
-    if let Source::ProfileStore { layer_names } = source {
-        for (l, n) in cfg.layers.iter_mut().zip(layer_names) {
-            l.name.clone_from(n);
-        }
+    if let Source::ProfileStore { names } = source {
+        names.fill(&mut cfg);
     }
     Ok(cfg)
 }
@@ -168,36 +159,36 @@ impl Prepared {
         matches!(&self.changes, Changes::Items(lines) if lines.is_empty())
     }
 
-    /// True when the write goes through the profile store (layer names are kept).
+    /// True when the write goes through the profile store (layer and macro names are kept).
     pub fn saves_to_profile_store(&self) -> bool {
         self.store.is_some()
     }
 }
 
-/// `cfg` with `names`' layer names, where it has none.
-fn with_names(mut cfg: Config, names: &Config) -> Config {
-    for (l, n) in cfg.layers.iter_mut().zip(&names.layers) {
-        if l.name.is_none() {
-            l.name.clone_from(&n.name);
-        }
-    }
-    cfg
+/// The config `blob` holds, named like `names`.
+fn named(blob: &Blob, names: &Config) -> Result<Config> {
+    let mut cfg = config::from_blob(blob)?;
+    Names::of(names).fill(&mut cfg);
+    Ok(cfg)
 }
 
 /// Encodes `cfg` for the device's current state and works out what writing
 /// it would change. Nothing is written.
 ///
 /// On a device with a profile store slot, the device's saved Studio profile is
-/// updated to match `cfg` (layers without a name keep their previous one); `cfg`
-/// is refused when a Studio profile can't express it exactly.
+/// updated to match `cfg` (layers and macros without a name keep their previous
+/// one); `cfg` is refused when a Studio profile can't express it exactly.
 pub fn prepare(dev: &Bnk8, cfg: &Config) -> Result<Prepared> {
     let device_crc = dev.status()?.token_b;
     let Some(slot) = read_slot(dev)? else {
         let mut cfg = cfg.clone();
         let mut notes = Vec::new();
-        if cfg.layers.iter().any(|l| l.name.is_some()) {
-            notes.push("layer names are kept only on keypads Binepad Studio has saved to, so they are ignored".into());
+        if cfg.layers.iter().any(|l| l.name.is_some()) || cfg.macros.values().any(|m| m.name.is_some()) {
+            notes.push(
+                "layer and macro names are kept only on keypads Binepad Studio has saved to, so they are ignored".into(),
+            );
             cfg.layers.iter_mut().for_each(|l| l.name = None);
+            cfg.macros.values_mut().for_each(|m| m.name = None);
         }
         let ids = StudioIds::new();
         let (native, changes) = match current(dev)? {
@@ -228,7 +219,8 @@ pub fn prepare(dev: &Bnk8, cfg: &Config) -> Result<Prepared> {
          make this change in Binepad Studio"
     );
 
-    let cfg = with_names(cfg.clone(), &prev_cfg);
+    let mut cfg = cfg.clone();
+    Names::of(&prev_cfg).fill(&mut cfg);
     let native = config::to_blob(&cfg, FACTORY, &ids)?;
     let new_profile = profile::to_profile(&cfg, &doc.profile, &aliases, &profile::now_utc())?;
     // What Studio will compile from the new profile must be exactly `native`.
@@ -243,9 +235,7 @@ pub fn prepare(dev: &Bnk8, cfg: &Config) -> Result<Prepared> {
     }
     let archive = archive::encode(&Document { device_id: doc.device_id, profile: new_profile })?;
 
-    let before = with_names(config::from_blob(&prev_native)?, &prev_cfg);
-    let after = with_names(config::from_blob(&native)?, &cfg);
-    let mut lines = config::diff(&before, &after);
+    let mut lines = config::diff(&named(&prev_native, &prev_cfg)?, &named(&native, &cfg)?);
     if lines.is_empty() && native != prev_native {
         lines.push("action table: reordered, bindings unchanged".into());
     }

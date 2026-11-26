@@ -16,8 +16,8 @@ use serde_json::{Map, Value, json};
 use crate::actions::{self, MACRO_SLOTS, MAX_LAYERS, fnv1a};
 use crate::studio_gestures::RESTRICTED;
 use crate::config::{
-    self, Blob, Config, DEVICE, EFFECTS, FORMAT, KEY_SLOTS, KEYS, KNOB_SLOTS, Key, Layer, Lighting, Slots, StudioIds,
-    Timing,
+    self, Blob, Config, DEVICE, EFFECTS, FORMAT, KEY_SLOTS, KEYS, KNOB_SLOTS, Key, Layer, Lighting, Macro, Names, Slots,
+    StudioIds, Timing,
 };
 
 /// Timing Studio's compiler always writes; its profile has no timing settings.
@@ -133,6 +133,29 @@ fn known_name(r: &Value, desktop_macros: &[String]) -> Option<String> {
     (!id.starts_with("raw.") && actions::decode(a) == id).then(|| id.to_string())
 }
 
+/// The layer and macro names in Studio's profile `p`. Names that aren't
+/// [`plain_name`](config::plain_name)s are skipped, so a write keeps them
+/// untouched, and so are macros' [default names](config::default_macro_name).
+pub fn names(p: &Value) -> Names {
+    let plain = |v: &Value| v.as_str().filter(|n| config::plain_name(n)).map(str::to_string);
+    let index = |v: &Value, max: usize| v.as_u64().and_then(|i| usize::try_from(i).ok()).filter(|i| *i < max);
+    let mut names = Names::default();
+    for l in p["layers"].as_array().into_iter().flatten() {
+        let Some(i) = index(&l["index"], MAX_LAYERS) else { continue };
+        if names.layers.len() <= i {
+            names.layers.resize(i + 1, None);
+        }
+        names.layers[i] = plain(&l["name"]);
+    }
+    for m in p["macros"].as_array().into_iter().flatten().filter(|m| m["storage"] == "OnDevice") {
+        let Some(slot) = index(&m["slot"], MACRO_SLOTS) else { continue };
+        if let Some(name) = plain(&m["name"]).filter(|n| *n != config::default_macro_name(slot)) {
+            names.macros.insert(config::macro_key(slot), name);
+        }
+    }
+    names
+}
+
 /// Decodes Studio's profile into a config, as Studio's compiler encodes it.
 /// Actions bnk8 can't encode itself are taken from `native` (the device's
 /// config compiled from this profile) at the same keymap position, checked by
@@ -203,9 +226,7 @@ pub fn from_profile(p: &Value, native: &Blob) -> Result<(Config, Aliases)> {
         }
         let source = if shared { layer0 } else { l };
         let lighting = lighting_from(&source["lighting"], shared).with_context(|| format!("layer {i} lighting"))?;
-        // Not plain text (too long, control characters): read as unnamed, so a write keeps it untouched.
-        let name = l["name"].as_str().filter(|s| config::plain_layer_name(s)).map(str::to_string);
-        out[i] = Some(Layer { name, keys: keys.into_iter().map(Key::from_slots).collect(), knob, lighting });
+        out[i] = Some(Layer { name: None, keys: keys.into_iter().map(Key::from_slots).collect(), knob, lighting });
     }
 
     let mut cfg_macros = BTreeMap::new();
@@ -235,17 +256,18 @@ pub fn from_profile(p: &Value, native: &Blob) -> Result<(Config, Aliases)> {
         }
         // An empty macro compiles to an unused slot.
         if !steps.is_empty() {
-            cfg_macros.insert(config::macro_key(slot), out_steps);
+            cfg_macros.insert(config::macro_key(slot), Macro::from(out_steps));
         }
     }
 
-    let cfg = Config {
+    let mut cfg = Config {
         format: FORMAT,
         device: DEVICE.into(),
         timing: STUDIO_TIMING,
         layers: out.into_iter().map(Option::unwrap).collect(),
         macros: cfg_macros,
     };
+    names(p).fill(&mut cfg);
     Ok((cfg, aliases))
 }
 
@@ -338,7 +360,7 @@ fn check_representable(cfg: &Config, aliases: &Aliases) -> Result<()> {
         }
         check_knob_selectors(p, layer)?;
     }
-    for (slot, steps) in &cfg.macros {
+    for (slot, Macro { steps, .. }) in &cfg.macros {
         ensure!(
             !steps.iter().any(|s| s.starts_with("raw.")),
             "macros.{slot}: raw steps can't be saved in Binepad Studio's profile"
@@ -449,9 +471,10 @@ fn macro_steps(steps: &[String]) -> Result<Vec<Value>> {
 
 /// Builds the profile to save with `cfg`, starting from the device's
 /// previous profile `prev`. bnk8 rewrites the layers' bindings, names and
-/// lighting, the on-device macros, the shared-lighting flag and `updatedAt`;
-/// everything else (app rules, desktop macros, Studio-only settings) is kept.
-/// Layers without a name keep the previous name at their position.
+/// lighting, the on-device macros and their names, the shared-lighting flag
+/// and `updatedAt`; everything else (app rules, desktop macros, Studio-only
+/// settings) is kept. Layers and macros without a name keep the previous name
+/// at their position.
 pub fn to_profile(cfg: &Config, prev: &Value, aliases: &Aliases, now: &str) -> Result<Value> {
     check_representable(cfg, aliases)?;
     let mut out = prev.as_object().context("the previous profile is not a JSON object")?.clone();
@@ -483,14 +506,15 @@ pub fn to_profile(cfg: &Config, prev: &Value, aliases: &Aliases, now: &str) -> R
             .map(str::to_string)
     };
     let mut macros = Vec::new();
-    for (key, steps) in &cfg.macros {
+    for (key, m) in &cfg.macros {
         let slot: usize = key.parse().with_context(|| format!("macros.{key}"))?;
         let slot = slot - 1;
+        let name = m.name.clone().or_else(|| prev_name(slot)).unwrap_or_else(|| config::default_macro_name(slot));
         macros.push(json!({
             "slot": slot,
-            "name": prev_name(slot).unwrap_or_else(|| format!("Macro {}", slot + 1)),
+            "name": name,
             "storage": "OnDevice",
-            "steps": macro_steps(steps).with_context(|| format!("macros.{key}"))?,
+            "steps": macro_steps(&m.steps).with_context(|| format!("macros.{key}"))?,
         }));
     }
     macros.sort_by_key(|m| m["slot"].as_u64());
@@ -551,7 +575,7 @@ mod tests {
     #[test]
     fn factory_config_round_trips_through_a_profile() {
         let mut cfg = factory();
-        cfg.macros.insert("3".into(), vec!["press modifier.left_gui".into(), "delay 20".into(), "tap keyboard.4".into(), "release modifier.left_gui".into()]);
+        cfg.macros.insert("3".into(), Macro { name: Some("Screenshot".into()), steps: ["press modifier.left_gui", "delay 20", "tap keyboard.4", "release modifier.left_gui"].map(String::from).to_vec() });
         cfg.layers[0].keys[7] = Key::Tap("macro.3".into());
         cfg.layers[1].lighting.key_colors = Some(vec!["#FF0000".into(), NONE.into(), NONE.into(), NONE.into(), NONE.into(), NONE.into(), NONE.into(), "#00FF00".into()]);
         let aliases = Aliases::default();
@@ -561,12 +585,34 @@ mod tests {
         // Unnamed layers keep the previous name, or get a default.
         assert_eq!(p["layers"][0]["name"], "Codex");
         assert_eq!(p["layers"][1]["name"], "Layer 2");
+        // Named macros keep their name both ways; unnamed ones keep the previous one.
+        assert_eq!(p["macros"][0]["name"], "Screenshot");
+        assert_eq!(back.macros["3"].name.as_deref(), Some("Screenshot"));
+        let mut unnamed = cfg.clone();
+        unnamed.macros.get_mut("3").unwrap().name = None;
+        assert_eq!(to_profile(&unnamed, &p, &aliases, "2026-11-24T00:00:00Z").unwrap()["macros"][0]["name"], "Screenshot");
         // Studio-only settings survive; desktop macros stay after the on-device ones.
         assert_eq!(p["applicationBindings"], prev()["applicationBindings"]);
         assert_eq!(p["macros"][0]["slot"], 2);
         assert_eq!(p["macros"][1]["storage"], "Desktop");
         assert_eq!(p["macros"][0]["steps"][1], json!({"delayMilliseconds": 20, "actionId": "keyboard.4", "event": "Tap"}));
         assert_eq!(p["updatedAt"], "2026-11-24T00:00:00Z");
+    }
+
+    #[test]
+    fn names_skip_default_and_unplain_ones() {
+        let p = json!({
+            "layers": [{"index": 0, "name": "Codex"}, {"index": 1, "name": ""}],
+            "macros": [
+                {"slot": 0, "name": "Copy", "storage": "OnDevice"},
+                {"slot": 1, "name": "Macro 2", "storage": "OnDevice"},
+                {"slot": 2, "name": "Bad\nname", "storage": "OnDevice"},
+                {"slot": 16, "name": "Desk", "storage": "Desktop"},
+            ],
+        });
+        let n = names(&p);
+        assert_eq!(n.layers, [Some("Codex".to_string()), None]);
+        assert_eq!(n.macros, BTreeMap::from([("1".to_string(), "Copy".to_string())]));
     }
 
     #[test]
@@ -754,7 +800,7 @@ mod tests {
         let mut edits = vec![base.clone()];
         // The live test's edit: K8 on layer 1 plays Cmd+Shift+4 from macro 1.
         let mut c = base.clone();
-        c.macros.insert("1".into(), ["press modifier.left_gui", "press modifier.left_shift", "tap keyboard.4", "release modifier.left_shift", "release modifier.left_gui"].map(String::from).to_vec());
+        c.macros.insert("1".into(), Macro::from(["press modifier.left_gui", "press modifier.left_shift", "tap keyboard.4", "release modifier.left_shift", "release modifier.left_gui"].map(String::from).to_vec()));
         c.layers[0].keys[7] = Key::Tap("macro.1".into());
         edits.push(c);
         // Layers, names, per-key colours, shared lighting, timing-free knob edits.

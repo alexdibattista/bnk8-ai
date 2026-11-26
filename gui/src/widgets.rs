@@ -1,5 +1,6 @@
 //! Action names for humans, and the action pickers.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use iced::widget::{pick_list, row, text, text_input, tooltip};
@@ -274,10 +275,12 @@ fn to_raw(name: &str) -> String {
     }
 }
 
-/// Category + item picker for one binding.
+/// Category + item picker for one binding; `macro_names` maps `macro.N` to
+/// the names of named macros.
 pub fn action_picker<'a, M: Clone + 'a>(
     catalog: &'a Catalog,
     value: Option<&'a str>,
+    macro_names: &BTreeMap<String, String>,
     on_change: impl Fn(Option<String>) -> M + Clone + 'a,
 ) -> Element<'a, M> {
     let cat = Category::of(value);
@@ -301,6 +304,24 @@ pub fn action_picker<'a, M: Clone + 'a>(
             )
             .into(),
         ),
+        Category::Macro if !macro_names.is_empty() => {
+            let choices: Vec<Choice> = catalog
+                .group(Category::Macro)
+                .iter()
+                .map(|c| match macro_names.get(&c.name) {
+                    Some(n) => Choice { name: c.name.clone(), label: format!("{} · {n}", c.label) },
+                    None => c.clone(),
+                })
+                .collect();
+            let selected = value.map(|v| choices.iter().find(|c| c.name == v).cloned().unwrap_or_else(|| Choice::new(v)));
+            Some(
+                pick_list(choices, selected, move |ch: Choice| on_change(Some(ch.name)))
+                    .width(PICKER_WIDTH)
+                    .menu_height(320)
+                    .style(style::field)
+                    .into(),
+            )
+        }
         c => Some(
             pick_list(catalog.group(c), value.map(Choice::new), move |ch: Choice| on_change(Some(ch.name)))
                 .width(PICKER_WIDTH)

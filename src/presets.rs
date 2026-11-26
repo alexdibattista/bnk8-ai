@@ -149,12 +149,12 @@ pub fn add(cfg: &mut Config, preset: &Preset, lighting: &Lighting) -> Result<usi
             Action(name) => return Some((*name).to_string()),
             Combo(keys) => combo_steps(keys),
         };
-        if let Some((slot, _)) = next.macros.iter().find(|(_, s)| **s == steps) {
+        if let Some((slot, _)) = next.macros.iter().find(|(_, m)| m.steps == steps) {
             return Some(format!("macro.{slot}"));
         }
         needed += 1;
         let slot = free.next()?;
-        next.macros.insert(slot.clone(), steps);
+        next.macros.insert(slot.clone(), steps.into());
         Some(format!("macro.{slot}"))
     };
     let mut keys = Vec::with_capacity(8);
@@ -227,7 +227,7 @@ mod tests {
     fn running_out_of_macro_slots_leaves_the_config_unchanged() {
         let mut cfg = factory();
         for m in 0..MACRO_SLOTS - 2 {
-            cfg.macros.entry(config::macro_key(m)).or_insert_with(|| vec![format!("tap keyboard.{}", m % 9 + 1)]);
+            cfg.macros.entry(config::macro_key(m)).or_insert_with(|| vec![format!("tap keyboard.{}", m % 9 + 1)].into());
         }
         let before = cfg.clone();
         let lighting = cfg.layers[0].lighting.clone();

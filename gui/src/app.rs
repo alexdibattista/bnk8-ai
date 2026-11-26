@@ -1,6 +1,7 @@
 //! The configurator window: device bar, layer list, keypad editor,
 //! macros, timing, and the pending-changes/apply bar.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::mpsc::{Sender, channel};
@@ -13,7 +14,9 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, Element, Fill, Font, Length, Task, Theme};
 
-use bnk8::config::{self, Blob, Changes, Config, FACTORY, KEY_SLOTS, KNOB_SLOTS, Key, Layer, Slots, StudioIds};
+use bnk8::config::{
+    self, Blob, Changes, Config, FACTORY, KEY_SLOTS, KNOB_SLOTS, Key, Layer, Macro, Names, Slots, StudioIds,
+};
 use bnk8::presets::{self, Preset};
 use bnk8::store::{self, Current, Source};
 use bnk8::{actions, transport};
@@ -63,10 +66,10 @@ struct Connected {
     /// snapshot, the factory config or the profile store's copy).
     config: Option<Box<Blob>>,
     source: String,
-    /// The device has a profile store slot, so writes keep layer names.
+    /// The device has a profile store slot, so writes keep layer and macro names.
     store: bool,
-    /// The loaded layer names, by index (profile store only).
-    layer_names: Vec<Option<String>>,
+    /// The loaded layer and macro names (profile store only).
+    names: Names,
 }
 
 /// The Macros tab's "Ask Claude" panel.
@@ -234,6 +237,7 @@ pub enum Message {
     SetSlot(&'static str, Option<String>),
     Lighting(LightingEdit),
     SelectMacro(usize),
+    MacroName(String),
     Step(usize, StepEdit),
     AddKeyStep,
     AddDelay,
@@ -428,10 +432,10 @@ impl App {
                         (None, cfg, "unknown".into(), false)
                     }
                 };
-                let layer_names = cfg.layers.iter().map(|l| l.name.clone()).collect();
+                let names = Names::of(&cfg);
                 self.cfg = cfg;
                 self.clamp_layer();
-                self.connected = Some(Connected { serial, config: blob, source, store, layer_names });
+                self.connected = Some(Connected { serial, config: blob, source, store, names });
             }
             Ok(Done::Written { blob, changes, edits, store }) => {
                 let Some(blob) = blob else {
@@ -439,20 +443,20 @@ impl App {
                     return Task::none();
                 };
                 // Names written: the edits' own, else the loaded ones (prepare keeps those).
-                let loaded = self.connected.as_ref().map_or_else(Vec::new, |c| c.layer_names.clone());
-                let layer_names: Vec<Option<String>> = if store {
-                    edits.layers.iter().enumerate().map(|(i, l)| l.name.clone().or(loaded.get(i).cloned().flatten())).collect()
-                } else {
-                    Vec::new()
+                let names = match &self.connected {
+                    Some(c) if store => {
+                        let mut named = edits.clone();
+                        c.names.fill(&mut named);
+                        Names::of(&named)
+                    }
+                    _ => Names::default(),
                 };
                 // The written config is the new diff base. Edits made while it was
                 // being written stay pending against it; otherwise the editor
                 // shows what the device now holds (the factory config after a reset).
                 if self.cfg == edits {
                     let mut cfg = config::from_blob(&blob).expect("written blob decodes");
-                    for (l, n) in cfg.layers.iter_mut().zip(&layer_names) {
-                        l.name.clone_from(n);
-                    }
+                    names.fill(&mut cfg);
                     self.cfg = cfg;
                     self.clamp_layer();
                 }
@@ -460,7 +464,7 @@ impl App {
                     c.config = Some(blob);
                     c.source = if store { "the device's profile store" } else { "last written by bnk8" }.into();
                     c.store = store;
-                    c.layer_names = layer_names;
+                    c.names = names;
                 }
                 self.info(format!("Saved {changes} change(s) to the device"));
             }
@@ -487,24 +491,20 @@ impl App {
     }
 
     /// What writing `blob` (the edited config) changes, per item; on devices
-    /// with a profile store, layer names count too (an unnamed layer keeps its name).
+    /// with a profile store, layer and macro names count too (unnamed ones keep
+    /// their name).
     fn changes(&self, blob: &Blob) -> Result<Changes> {
         let Some(c) = self.connected.as_ref() else { return config::changes(None, blob) };
         let Some(before) = c.config.as_deref() else { return config::changes(None, blob) };
         if !c.store {
             return config::changes(Some(before), blob);
         }
-        let named = |b: &Blob, names: &[Option<String>]| -> Result<Config> {
+        let named = |b: &Blob, names: &[&Names]| -> Result<Config> {
             let mut cfg = config::from_blob(b)?;
-            for (l, n) in cfg.layers.iter_mut().zip(names) {
-                l.name.clone_from(n);
-            }
+            names.iter().for_each(|n| n.fill(&mut cfg));
             Ok(cfg)
         };
-        let names: Vec<Option<String>> = (self.cfg.layers.iter().enumerate())
-            .map(|(i, l)| l.name.clone().or(c.layer_names.get(i).cloned().flatten()))
-            .collect();
-        let mut lines = config::diff(&named(before, &c.layer_names)?, &named(blob, &names)?);
+        let mut lines = config::diff(&named(before, &[&c.names])?, &named(blob, &[&Names::of(&self.cfg), &c.names])?);
         if lines.is_empty() && blob != before {
             lines.push("action table: reordered, bindings unchanged".into());
         }
@@ -650,6 +650,20 @@ impl App {
                 }
             }
             Message::SelectMacro(m) => self.macro_slot = m,
+            Message::MacroName(s) => {
+                let slot = self.macro_slot;
+                let key = config::macro_key(slot);
+                let loaded = self.connected.as_ref().is_some_and(|c| c.names.macros.contains_key(&key));
+                if let Some(m) = self.cfg.macros.get_mut(&key) {
+                    let s: String = s.chars().filter(|c| !c.is_control()).take(config::MAX_NAME).collect();
+                    // Cleared: the default name, as `None` would keep the loaded one.
+                    m.name = match s.trim() {
+                        "" if loaded => Some(config::default_macro_name(slot)),
+                        "" => None,
+                        _ => Some(s),
+                    };
+                }
+            }
             Message::Step(i, edit) => self.edit_macro(|steps| {
                 // A stale message for a step that no longer exists.
                 if i >= steps.len() {
@@ -700,9 +714,7 @@ impl App {
             Message::Discard if idle => {
                 let mut cfg = config::from_blob(self.base()).expect("base decodes");
                 if let Some(c) = &self.connected {
-                    for (l, n) in cfg.layers.iter_mut().zip(&c.layer_names) {
-                        l.name.clone_from(n);
-                    }
+                    c.names.fill(&mut cfg);
                 }
                 self.cfg = cfg;
                 self.clamp_layer();
@@ -747,11 +759,20 @@ impl App {
     /// Edits the selected macro's steps; an emptied macro is removed.
     fn edit_macro(&mut self, f: impl FnOnce(&mut Vec<String>)) {
         let key = config::macro_key(self.macro_slot);
-        let mut steps = self.cfg.macros.remove(&key).unwrap_or_default();
-        f(&mut steps);
-        if !steps.is_empty() {
-            self.cfg.macros.insert(key, steps);
+        let mut m = self.cfg.macros.remove(&key).unwrap_or_default();
+        f(&mut m.steps);
+        if !m.steps.is_empty() {
+            self.cfg.macros.insert(key, m);
         }
+    }
+
+    /// Macro `slot`'s name as Apply writes it (its own, else the loaded one),
+    /// unless it is the default `Macro N`.
+    fn macro_name(&self, slot: usize) -> Option<&str> {
+        let key = config::macro_key(slot);
+        let own = self.cfg.macros.get(&key)?.name.as_ref();
+        let loaded = self.connected.as_ref().and_then(|c| c.names.macros.get(&key));
+        own.or(loaded).map(String::as_str).filter(|n| *n != config::default_macro_name(slot))
     }
 
     /// The "Ask Claude" panel. Claude Code runs on threads of its own, never
@@ -782,7 +803,11 @@ impl App {
                     && !prompt.is_empty()
                 {
                     let claude = claude.clone();
-                    let system = assistant::system_prompt(&self.cfg.macros, self.macro_slot);
+                    let mut named = self.cfg.clone();
+                    if let Some(c) = &self.connected {
+                        c.names.fill(&mut named);
+                    }
+                    let system = assistant::system_prompt(&named.macros, self.macro_slot);
                     self.ai.asking = true;
                     self.ai.answer = None;
                     return Task::perform(assistant::background(move || assistant::ask(&claude, &system, &prompt)), |r| {
@@ -799,13 +824,14 @@ impl App {
                     && !a.macros.is_empty()
                 {
                     for p in &a.macros {
-                        self.cfg.macros.insert(config::macro_key(p.slot), p.steps.clone());
+                        let m = Macro { name: Some(p.name.clone()), steps: p.steps.clone() };
+                        self.cfg.macros.insert(config::macro_key(p.slot), m);
                     }
                     self.macro_slot = a.macros[0].slot;
                     let list = a
                         .macros
                         .iter()
-                        .map(|p| format!("Macro {} ({})", p.slot + 1, p.description))
+                        .map(|p| format!("Macro {} ({})", p.slot + 1, p.name))
                         .collect::<Vec<_>>()
                         .join(", ");
                     self.ai.answer = None;
@@ -1020,11 +1046,14 @@ impl App {
         let bound = face.is_some();
         let gestures = KEY_SLOTS.iter().filter(|s| slots.get(s).is_some()).count();
         let extra = gestures - usize::from(bound);
-        // Macros read as the shortcut they play, e.g. Cmd+Shift+A.
+        // Macros read as their name, else the shortcut they play (Cmd+Shift+A).
         let shortcut = face
             .and_then(|f| f.strip_prefix("macro."))
-            .and_then(|n| self.cfg.macros.get(n))
-            .map(|steps| macro_summary(steps))
+            .and_then(|n| {
+                let m = self.cfg.macros.get(n)?;
+                let name = self.macro_name(n.parse::<usize>().ok()?.checked_sub(1)?);
+                Some(name.map_or_else(|| macro_summary(&m.steps), str::to_string))
+            })
             .filter(|s| !s.is_empty());
         let label = shortcut.clone().unwrap_or_else(|| short(face));
         let note = match (shortcut.is_some().then(|| short(face)), on_hold) {
@@ -1094,13 +1123,14 @@ impl App {
             Control::Knob => ("Knob".into(), &KNOB_SLOTS, &SLOT_LABELS),
         };
         let knob = self.control == Control::Knob;
+        let macro_labels = self.macro_labels();
         let rows = names.iter().zip(labels).map(|(&name, &label)| {
             let label = if knob && name == "tap" { "Press" } else { label };
             let value = match self.control {
                 Control::Key(k) => key_slot(&layer.keys[k], name),
                 Control::Knob => layer.knob.get(name).map(String::as_str),
             };
-            field_row(label, action_picker(&self.catalog, value, move |v| Message::SetSlot(name, v)))
+            field_row(label, action_picker(&self.catalog, value, &macro_labels, move |v| Message::SetSlot(name, v)))
         });
         card(
             format!("{title} bindings"),
@@ -1194,17 +1224,17 @@ impl App {
 
     fn macros_tab(&self) -> Element<'_, Message> {
         let list = (0..actions::MACRO_SLOTS).map(|m| {
-            let n = self.cfg.macros.get(&config::macro_key(m)).map_or(0, |s| key_steps(s));
+            let n = self.cfg.macros.get(&config::macro_key(m)).map_or(0, |x| key_steps(&x.steps));
             let count = match n {
                 0 => "empty".to_string(),
                 1 => "1 step".to_string(),
                 n => format!("{n} steps"),
             };
-            let content = row![
-                text(format!("Macro {}", m + 1)).size(14).width(Fill),
-                text(count).size(12).style(if n == 0 { style::section } else { style::muted }),
-            ]
-            .align_y(Alignment::Center);
+            let title = column![text(format!("Macro {}", m + 1)).size(14)]
+                .push(self.macro_name(m).map(|name| text(elide(name, 22)).size(12).style(style::muted)))
+                .width(Fill);
+            let content = row![title, text(count).size(12).style(if n == 0 { style::section } else { style::muted })]
+                .align_y(Alignment::Center);
             nav_button(content, self.macro_slot == m, Message::SelectMacro(m))
         });
         column![
@@ -1225,7 +1255,8 @@ impl App {
 
     fn macro_editor(&self) -> Element<'_, Message> {
         let m = self.macro_slot;
-        let steps: &[String] = self.cfg.macros.get(&config::macro_key(m)).map_or(&[], Vec::as_slice);
+        let mac = self.cfg.macros.get(&config::macro_key(m));
+        let steps: &[String] = mac.map_or(&[], |x| x.steps.as_slice());
         let n = steps.len();
         let rows = steps.iter().enumerate().map(|(i, step)| {
             let (verb, arg) = parse_step(step);
@@ -1286,11 +1317,32 @@ impl App {
             button(text("Clear").size(13)).style(style::ghost_danger).on_press_maybe((n > 0).then_some(Message::ClearSteps)),
         ]
         .spacing(8);
+        let placeholder = if mac.is_some() { config::default_macro_name(m) } else { "Add a step to name it".into() };
+        let name = text_input(&placeholder, self.macro_name(m).unwrap_or_default())
+            .on_input_maybe(mac.is_some().then_some(Message::MacroName))
+            .width(280)
+            .style(style::input);
+        let unsaved = self
+            .connected
+            .as_ref()
+            .is_some_and(|c| !c.store)
+            .then(|| hint("This keypad keeps names only once Binepad Studio has saved to it; Export TOML keeps them."));
         card(
             format!("Macro {}", m + 1),
-            column![list, actions, hint("A delay (multiple of 10 ms, up to 2550 ms) waits before the next key step.")]
+            column![field_row("Name", name)]
+                .push(unsaved)
+                .push(list)
+                .push(actions)
+                .push(hint("A delay (multiple of 10 ms, up to 2550 ms) waits before the next key step."))
                 .spacing(14),
         )
+    }
+
+    /// `macro.N` -> the macro's name, for macros with one.
+    fn macro_labels(&self) -> BTreeMap<String, String> {
+        (0..actions::MACRO_SLOTS)
+            .filter_map(|m| Some((format!("macro.{}", config::macro_key(m)), self.macro_name(m)?.to_string())))
+            .collect()
     }
 
     /// "Ask Claude": sign-in state, the prompt, and Claude's proposed macros.
@@ -1369,17 +1421,21 @@ impl App {
     /// Claude's reply and proposed macros, with Add to macros / Dismiss.
     fn ai_answer<'a>(&'a self, a: &'a Answer) -> Element<'a, Message> {
         let proposals = a.macros.iter().map(|p| {
-            let replaces = self
-                .cfg
-                .macros
-                .get(&config::macro_key(p.slot))
-                .filter(|old| **old != p.steps)
-                .map(|old| text(format!("Replaces its current {} step(s).", key_steps(old))).size(12).style(style::muted));
+            let default = config::default_macro_name(p.slot);
+            let note = self.cfg.macros.get(&config::macro_key(p.slot)).and_then(|old| {
+                if old.steps != p.steps {
+                    Some(format!("Replaces its current {} step(s).", key_steps(&old.steps)))
+                } else if self.macro_name(p.slot).unwrap_or(&default) != p.name {
+                    Some("Renames it; the steps stay the same.".into())
+                } else {
+                    None
+                }
+            });
             let details = column![
-                text(&p.description).size(13),
+                text(&p.name).size(13),
                 text(p.steps.join(" · ")).size(12).font(Font::MONOSPACE).style(style::muted),
             ]
-            .push(replaces)
+            .push(note.map(|s| text(s).size(12).style(style::muted)))
             .spacing(4);
             row![text(format!("Macro {}", p.slot + 1)).font(SEMIBOLD).width(80), details].spacing(12).into()
         });

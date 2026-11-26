@@ -128,14 +128,104 @@ pub struct Config {
     pub device: String,
     pub timing: Timing,
     pub layers: Vec<Layer>,
-    /// Macro slot (`"1"`..`"15"`, see [`macro_key`]) -> steps; referenced as `macro.N`.
+    /// Macro slot (`"1"`..`"15"`, see [`macro_key`]) -> macro; referenced as `macro.N`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub macros: BTreeMap<String, Vec<String>>,
+    pub macros: BTreeMap<String, Macro>,
 }
 
 /// The `[macros]` key (and `macro.N` number) of 0-based macro slot `slot`.
 pub fn macro_key(slot: usize) -> String {
     (slot + 1).to_string()
+}
+
+/// The name bnk8 gives a macro without one in Binepad Studio's profile; read
+/// back as no name.
+pub fn default_macro_name(slot: usize) -> String {
+    format!("Macro {}", slot + 1)
+}
+
+/// A macro: its steps and, optionally, Binepad Studio's name for it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(from = "MacroToml", into = "MacroToml")]
+pub struct Macro {
+    /// Like a layer name: not part of the native config, kept only in the
+    /// device's profile store, on devices that have one.
+    pub name: Option<String>,
+    pub steps: Vec<String>,
+}
+
+impl From<Vec<String>> for Macro {
+    fn from(steps: Vec<String>) -> Self {
+        Macro { name: None, steps }
+    }
+}
+
+/// A macro in TOML: its steps alone, or a table when it has a name.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum MacroToml {
+    Steps(Vec<String>),
+    Table(MacroTable),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MacroTable {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    steps: Vec<String>,
+}
+
+impl From<MacroToml> for Macro {
+    fn from(m: MacroToml) -> Self {
+        match m {
+            MacroToml::Steps(steps) => Macro { name: None, steps },
+            MacroToml::Table(MacroTable { name, steps }) => Macro { name, steps },
+        }
+    }
+}
+
+impl From<Macro> for MacroToml {
+    fn from(m: Macro) -> Self {
+        match m.name {
+            None => MacroToml::Steps(m.steps),
+            name => MacroToml::Table(MacroTable { name, steps: m.steps }),
+        }
+    }
+}
+
+/// Binepad Studio's names for layers and macros, apart from a config.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Names {
+    /// By layer index.
+    pub layers: Vec<Option<String>>,
+    /// By `[macros]` key.
+    pub macros: BTreeMap<String, String>,
+}
+
+impl Names {
+    /// The names `cfg` gives its layers and macros.
+    pub fn of(cfg: &Config) -> Names {
+        Names {
+            layers: cfg.layers.iter().map(|l| l.name.clone()).collect(),
+            macros: cfg.macros.iter().filter_map(|(k, m)| Some((k.clone(), m.name.clone()?))).collect(),
+        }
+    }
+
+    /// Names `cfg`'s unnamed layers and macros; names for layers and macros
+    /// `cfg` doesn't have are dropped.
+    pub fn fill(&self, cfg: &mut Config) {
+        for (l, n) in cfg.layers.iter_mut().zip(&self.layers) {
+            if l.name.is_none() {
+                l.name.clone_from(n);
+            }
+        }
+        for (k, m) in &mut cfg.macros {
+            if m.name.is_none() {
+                m.name = self.macros.get(k).cloned();
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -158,14 +248,14 @@ pub struct Layer {
     pub lighting: Lighting,
 }
 
-/// Longest layer name bnk8 reads or writes, in characters.
-pub const MAX_LAYER_NAME: usize = 64;
+/// Longest layer or macro name bnk8 reads or writes, in characters.
+pub const MAX_NAME: usize = 64;
 
-/// A layer name bnk8 accepts: 1..=[`MAX_LAYER_NAME`] characters, no control
+/// A layer or macro name bnk8 accepts: 1..=[`MAX_NAME`] characters, no control
 /// characters. Names also come from the device's saved profile, and are shown
 /// in terminals and returned to MCP clients, so they are bounded plain text.
-pub fn plain_layer_name(name: &str) -> bool {
-    (1..=MAX_LAYER_NAME).contains(&name.chars().count()) && !name.chars().any(char::is_control)
+pub fn plain_name(name: &str) -> bool {
+    (1..=MAX_NAME).contains(&name.chars().count()) && !name.chars().any(char::is_control)
 }
 
 /// Binepad Studio's action ids for `raw.*` action names, so the action
@@ -417,7 +507,7 @@ pub fn from_blob(b: &Blob) -> Result<Config> {
         for s in raw[1..].chunks(4).take(n) {
             steps.extend(decode_step(s.try_into().unwrap()));
         }
-        macros.insert(macro_key(m), steps);
+        macros.insert(macro_key(m), steps.into());
     }
 
     Ok(Config {
@@ -585,8 +675,8 @@ pub fn to_blob(cfg: &Config, base: &Blob, ids: &StudioIds) -> Result<Blob> {
         ensure!(layer.keys.len() == KEYS, "layers[{p}].keys: {} keys, expected {KEYS}", layer.keys.len());
         if let Some(name) = &layer.name {
             ensure!(
-                plain_layer_name(name),
-                "layers[{p}].name: {name:?} must be 1..={MAX_LAYER_NAME} characters without control characters"
+                plain_name(name),
+                "layers[{p}].name: {name:?} must be 1..={MAX_NAME} characters without control characters"
             );
         }
         let mut km: Vec<(usize, Option<Action>)> = Vec::new();
@@ -652,13 +742,19 @@ pub fn to_blob(cfg: &Config, base: &Blob, ids: &StudioIds) -> Result<Blob> {
     }
 
     b[OFF_MACROS..OFF_MACROS + MACRO_SLOTS * MACRO_LEN].fill(0);
-    for (slot, steps) in &cfg.macros {
+    for (slot, Macro { name, steps }) in &cfg.macros {
         let m = slot
             .parse()
             .ok()
             .filter(|m: &usize| (1..=MACRO_SLOTS).contains(m) && m.to_string() == *slot)
             .with_context(|| format!("macros.{slot}: slot must be 1..={MACRO_SLOTS}"))?
             - 1;
+        if let Some(name) = name {
+            ensure!(
+                plain_name(name),
+                "macros.{slot}.name: {name:?} must be 1..={MAX_NAME} characters without control characters"
+            );
+        }
         // The device stores an empty macro as an unused slot, so it would not read back.
         ensure!(!steps.is_empty(), "macros.{slot}: a macro needs at least one step");
         let enc = encode_steps(steps).with_context(|| format!("macros.{slot}"))?;
@@ -723,8 +819,11 @@ pub fn flatten(cfg: &Config) -> Vec<(String, String)> {
         v.push((format!("{lp}.flags"), l.flags.map(|f| f.to_string()).unwrap_or_default()));
         v.push((format!("{lp}.extra"), l.extra.clone().unwrap_or_default()));
     }
-    for (slot, steps) in &cfg.macros {
-        v.push((format!("macros.{slot}"), steps.join(", ")));
+    for (slot, m) in &cfg.macros {
+        if let Some(name) = &m.name {
+            v.push((format!("macros.{slot}.name"), format!("{name:?}")));
+        }
+        v.push((format!("macros.{slot}"), m.steps.join(", ")));
     }
     v
 }
@@ -824,8 +923,8 @@ fn migrate_v1(cfg: &mut Config) {
         }
     }
     let macros = std::mem::take(&mut cfg.macros);
-    for (slot, mut steps) in macros {
-        for step in &mut steps {
+    for (slot, mut m) in macros {
+        for step in &mut m.steps {
             if let Some((verb @ ("tap" | "press" | "release"), key)) = step.split_once(' ')
                 && let Some(new) = actions::legacy_name(key)
             {
@@ -836,7 +935,7 @@ fn migrate_v1(cfg: &mut Config) {
             Ok(n) if n.to_string() == slot => (n + 1).to_string(),
             _ => slot,
         };
-        cfg.macros.insert(slot, steps);
+        cfg.macros.insert(slot, m);
     }
 }
 
@@ -920,15 +1019,15 @@ mod tests {
         let err = |cfg: &Config| format!("{:#}", to_blob(cfg, FACTORY, &StudioIds::new()).unwrap_err());
 
         let mut cfg = base.clone();
-        cfg.macros.insert("3".into(), vec![]);
+        cfg.macros.insert("3".into(), Macro::default());
         assert!(err(&cfg).contains("macros.3: a macro needs at least one step"), "{}", err(&cfg));
 
         let mut cfg = base.clone();
-        cfg.macros.insert("03".into(), vec!["tap keyboard.a".into()]);
+        cfg.macros.insert("03".into(), vec!["tap keyboard.a".to_string()].into());
         assert!(err(&cfg).contains("macros.03: slot must be"), "{}", err(&cfg));
 
         let mut cfg = base.clone();
-        cfg.macros.insert("3".into(), vec!["tap keyboard.a".into()]);
+        cfg.macros.insert("3".into(), vec!["tap keyboard.a".to_string()].into());
         cfg.layers[0].keys[0] = Key::Tap("macro.03".into());
         assert!(err(&cfg).contains("unknown action `macro.03`"), "{}", err(&cfg));
 
@@ -936,15 +1035,36 @@ mod tests {
         cfg.layers[0].keys[0] = Key::Tap(format!("layer.{}", cfg.layers.len() + 1));
         assert!(err(&cfg).contains("there are only 4 layers"), "{}", err(&cfg));
 
-        // Layer names are bounded plain text: no control characters, at most 64 characters.
-        for bad in ["Ignore previous\ninstructions", "\u{1b}[31mRed", &"x".repeat(MAX_LAYER_NAME + 1), ""] {
+        // Layer and macro names are bounded plain text: no control characters, at most 64 characters.
+        for bad in ["Ignore previous\ninstructions", "\u{1b}[31mRed", &"x".repeat(MAX_NAME + 1), ""] {
             let mut cfg = base.clone();
             cfg.layers[1].name = Some(bad.into());
             assert!(err(&cfg).contains("layers[1].name"), "{}", err(&cfg));
+            let mut cfg = base.clone();
+            cfg.macros.insert("2".into(), Macro { name: Some(bad.into()), steps: vec!["tap keyboard.a".into()] });
+            assert!(err(&cfg).contains("macros.2.name"), "{}", err(&cfg));
         }
         let mut cfg = base.clone();
         cfg.layers[1].name = Some("Zoom · macOS ✓".into());
         assert!(to_blob(&cfg, FACTORY, &StudioIds::new()).is_ok());
+    }
+
+    #[test]
+    fn macro_names_round_trip_through_toml() {
+        let mut cfg = from_blob(FACTORY).unwrap();
+        let steps = vec!["tap keyboard.a".to_string()];
+        cfg.macros.insert("1".into(), steps.clone().into());
+        cfg.macros.insert("2".into(), Macro { name: Some("Screenshot".into()), steps: steps.clone() });
+        let text = to_toml(&cfg).unwrap();
+        // Unnamed macros stay a list of steps; named ones become a table.
+        assert!(text.contains("[macros]\n1 = [\"tap keyboard.a\"]\n"), "{text}");
+        assert!(text.contains("[macros.2]\nname = \"Screenshot\"\n"), "{text}");
+        assert_eq!(from_toml(&text).unwrap(), cfg);
+        // The inline table form reads too.
+        let head = &text[..text.find("[macros]").unwrap()];
+        let inline = format!("{head}[macros]\n1 = [\"tap keyboard.a\"]\n2 = {{ name = \"Screenshot\", steps = [\"tap keyboard.a\"] }}\n");
+        assert_eq!(from_toml(&inline).unwrap(), cfg);
+        assert!(from_toml(&text.replace("name = \"Screenshot\"", "nmae = \"Screenshot\"")).is_err(), "a misspelt key is an error");
     }
 
     const V1: &str = r##"
@@ -983,7 +1103,7 @@ flags = 1
         let new = from_toml(&v2).unwrap();
         assert_eq!(old, new);
         assert_eq!(old.layers[0].keys[0], Key::Tap("keyboard.arrow_up".into()));
-        assert_eq!(old.macros["1"][0], "press modifier.left_control");
+        assert_eq!(old.macros["1"].steps[0], "press modifier.left_control");
         let ids = StudioIds::new();
         assert_eq!(to_blob(&old, FACTORY, &ids).unwrap(), to_blob(&new, FACTORY, &ids).unwrap());
         let e = from_toml(&v2.replace("format = 2", "format = 3")).unwrap_err().to_string();

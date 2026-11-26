@@ -67,7 +67,7 @@ cargo run --release -p bnk8-gui
 Plug the BNK8 in first; the app finds and loads it on startup (press **Refresh** if you plug it in later).
 
 - **Keys & lighting**: click a key or the knob on the keypad, then choose what each gesture does (tap, double tap, hold, tap then hold; the knob also has turn left/right). Set the layer's effect, brightness, speed and colour, a colour per key, and whether every layer shares one lighting setup.
-- **Macros**: up to 15 macros of up to 7 key steps, with optional delays. **Ask Claude** writes macros from a description such as "Cmd+Shift+4 to capture part of the screen". It needs [Claude Code](https://claude.com/claude-code) and runs on your own Claude subscription: press **Sign in with Claude** (or run `claude auth login` in Terminal). Claude only proposes macros; you review them, **Add to macros** stages them as edits, and nothing reaches the device until **Apply to device**.
+- **Macros**: up to 15 macros of up to 7 key steps, with optional delays. Give a macro a name (up to 64 characters) and the keypad view and binding pickers show it; like layer names, names are saved on keypads Binepad Studio has saved to. **Ask Claude** writes and names macros from a description such as "Cmd+Shift+4 to capture part of the screen". It needs [Claude Code](https://claude.com/claude-code) and runs on your own Claude subscription: press **Sign in with Claude** (or run `claude auth login` in Terminal). Claude only proposes macros; you review them, **Add to macros** stages them as edits, and nothing reaches the device until **Apply to device**.
 - **Timing**: double-tap window and hold threshold.
 - **Layer templates**: **+ Add from template…** adds a ready-made layer for **Zoom** or **Google Meet** (macOS or Windows/Linux shortcuts). Shortcuts with modifier keys are stored as macros, so each template uses up to 6 free macro slots.
 - Edits stay local until you press **Apply to device**. The bottom bar shows how many changes are pending, and you can list them. **Import/Export TOML** uses the same format as the CLI.
@@ -159,6 +159,7 @@ key_colors = ["none", "none", "#00FF00", "none", "none", "none", "none", "none"]
 
 [macros]                       # up to 15 macros (1..15), up to 7 key steps each
 1 = ["press modifier.left_control", "delay 10", "tap keyboard.q", "delay 10", "release modifier.left_control"]
+2 = { name = "Screenshot", steps = ["press modifier.left_gui", "press modifier.left_shift", "tap keyboard.4", "release modifier.left_shift", "release modifier.left_gui"] }  # optional name, as for layers
 ```
 
 [`configs/omp.toml`](configs/omp.toml) is a complete real-world config.
@@ -188,7 +189,7 @@ Keep a `layer.next` binding (factory: knob press) on every layer so you can alwa
 
 ## How reading the config works
 
-The device reports a CRC-32 of its active config, and bnk8 trusts a config only when its CRC matches. It looks in three places: the copy saved in the device's profile store (where Binepad Studio, and then bnk8, save), the file bnk8 saves after every write (`~/.local/state/bnk8/<serial>.bin`, or `$XDG_STATE_HOME/bnk8/`), and the built-in factory config (also those of firmware 6.0.19, 6.0.21 and 6.0.24). With the profile store's copy, `dump`, `info` and the app also show the layer names.
+The device reports a CRC-32 of its active config, and bnk8 trusts a config only when its CRC matches. It looks in three places: the copy saved in the device's profile store (where Binepad Studio, and then bnk8, save), the file bnk8 saves after every write (`~/.local/state/bnk8/<serial>.bin`, or `$XDG_STATE_HOME/bnk8/`), and the built-in factory config (also those of firmware 6.0.19, 6.0.21 and 6.0.24). With the profile store's copy, `dump`, `info` and the app also show the layer and macro names.
 
 If none of them matches (for example, another tool wrote the config), it shows as **unknown**: editing starts from the factory defaults, and applying writes the whole config. Every write replaces all 2000 bytes; the per-item changes shown are for your review.
 

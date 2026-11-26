@@ -90,21 +90,6 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The named layers of a profile as `(index, name)`; names that aren't
-/// [`plain_layer_name`](crate::config::plain_layer_name)s are skipped.
-pub fn layer_names(profile: &Value) -> Vec<(usize, String)> {
-    profile["layers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|l| {
-            let index = usize::try_from(l["index"].as_u64()?).ok()?;
-            let name = l["name"].as_str().filter(|n| crate::config::plain_layer_name(n))?;
-            Some((index, name.to_string()))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,11 +102,9 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_and_reads_named_layers() {
+    fn round_trips() {
         let d = doc(DEVICE);
-        let back = decode(&encode(&d).unwrap()).unwrap();
-        assert_eq!(back, d);
-        assert_eq!(layer_names(&back.profile), [(0, "Codex".to_string())]);
+        assert_eq!(decode(&encode(&d).unwrap()).unwrap(), d);
     }
 
     #[test]
