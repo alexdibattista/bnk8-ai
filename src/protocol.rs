@@ -146,8 +146,9 @@ impl Bnk8 {
         s
     }
 
-    /// Sends one command frame and waits for its reply, skipping async
-    /// frames and mismatched/stale ones. Maps NAK to [`Nak`].
+    /// Sends one command frame and waits for its reply (status 1, ACK),
+    /// skipping async, request-shaped and mismatched/stale frames. Maps NAK
+    /// (status 3) to [`Nak`].
     fn exchange(&self, msg: u8, payload: &[u8]) -> Result<Frame> {
         ensure!(
             payload.len() <= REPORT_LEN - 10,
@@ -181,11 +182,11 @@ impl Bnk8 {
             if f.msg_type() != msg || f.seq() != seq {
                 continue; // stale or foreign frame
             }
-            if f.status() == 3 {
-                let code = f.payload().first().copied().unwrap_or(0);
-                return Err(Nak(code).into());
+            match f.status() {
+                1 => return Ok(f),
+                3 => return Err(Nak(f.payload().first().copied().unwrap_or(0)).into()),
+                _ => continue, // not a reply
             }
-            return Ok(f);
         }
     }
 
@@ -342,6 +343,8 @@ impl Bnk8 {
             "profile archive is {archive_len} bytes, expected 48..={STREAM_SIZE_MAX}"
         );
         let archive_len = archive_len as u16;
+        // The firmware refuses revision 0xFFFFFFFF; the new slot is `revision + 1`.
+        ensure!(revision < u32::MAX, "the profile store is at its last revision {revision}");
         let crc = crc32(payload);
         let idle = self.store_wait_idle()?;
         ensure!(
@@ -524,8 +527,9 @@ impl Bnk8 {
     /// otherwise; cancelling would abort a Binepad Studio save in progress).
     /// Refuses while the store holds a valid slot: the firmware then NAKs
     /// sub-0 begins, so such devices are written with [`Bnk8::store_save`].
-    /// On success the device's token B equals the blob's CRC.
-    pub fn write_config(&self, blob: &[u8; CONFIG_LEN]) -> Result<()> {
+    /// On success the device's token B equals the blob's CRC. Fails without
+    /// writing unless the device still holds the config with CRC `expected`.
+    pub fn write_config(&self, blob: &[u8; CONFIG_LEN], expected: u32) -> Result<()> {
         let stream = self.store_wait_idle()?;
         ensure!(
             stream.revision == 0,
@@ -535,6 +539,10 @@ impl Bnk8 {
         );
         let crc = crc32(blob);
         let status = self.status()?;
+        ensure!(
+            status.token_b == expected,
+            "the device's config changed since the changes were worked out; read it again"
+        );
         // With the stream manager idle and no profile-store slot, NAK 3 means another
         // transfer session is still open. The firmware drops it after 2.5 s without traffic.
         let session = self.transfer_begin_persist(status.token_a, crc).map_err(|e| match e.downcast_ref::<Nak>() {

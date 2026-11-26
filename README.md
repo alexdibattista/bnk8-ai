@@ -105,7 +105,7 @@ Claude gets four tools:
 - `preview_config`: validates an edited config and lists the per-item changes, without writing. It returns a preview id.
 - `apply_config`: writes the config. It needs the preview id for that exact config and an unchanged device, so you always see the changes before anything is written.
 
-Your client asks you to approve each tool call. The keypad is opened only for the duration of a call, so Binepad Studio, the desktop app and the CLI can keep using it.
+Your client asks you to approve each tool call, and that prompt is the safeguard: the preview id only shows that `apply_config` writes exactly the previewed changes to the same keypad, not that you saw them. Read the listed changes before approving `apply_config`. The keypad is opened only for the duration of a call, so Binepad Studio, the desktop app and the CLI can keep using it.
 
 **Claude Desktop:** add this to `~/Library/Application Support/Claude/claude_desktop_config.json`, then restart Desktop:
 

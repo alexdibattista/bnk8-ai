@@ -37,20 +37,58 @@ Config rules:
 const STALE_PREVIEW: &str = "The config or the device changed since preview_config returned that id; \
                              call preview_config again and show the user the new changes.";
 
+/// Longest JSON-RPC message accepted, in bytes; a complete config is a few KiB.
+const MAX_MESSAGE: usize = 1 << 20;
+
 /// Serves MCP over newline-delimited JSON-RPC until `input` ends.
-pub fn serve(serial: Option<&str>, input: impl BufRead, mut output: impl Write) -> Result<()> {
-    for line in input.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(resp) = handle(serial, &line) {
+pub fn serve(serial: Option<&str>, mut input: impl BufRead, mut output: impl Write) -> Result<()> {
+    let mut line = Vec::new();
+    while let Some(fits) = read_line(&mut input, &mut line)? {
+        let resp = if !fits {
+            Some(error(Value::Null, -32600, format!("invalid request: longer than {MAX_MESSAGE} bytes")))
+        } else if line.trim_ascii().is_empty() {
+            None
+        } else {
+            match std::str::from_utf8(&line) {
+                Ok(text) => handle(serial, text),
+                Err(e) => Some(error(Value::Null, -32700, format!("parse error: {e}"))),
+            }
+        };
+        if let Some(resp) = resp {
             output.write_all(serde_json::to_string(&resp)?.as_bytes())?;
             output.write_all(b"\n")?;
             output.flush()?;
         }
     }
     Ok(())
+}
+
+/// Reads the next line, without its newline, into `line`, keeping at most
+/// [`MAX_MESSAGE`] bytes. `None` at the end of input; `Some(false)` when the
+/// line was longer (the rest is skipped and `line` left empty).
+fn read_line(input: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::Result<Option<bool>> {
+    line.clear();
+    let (mut fits, mut read) = (true, false);
+    loop {
+        let chunk = input.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(read.then_some(fits));
+        }
+        read = true;
+        let end = chunk.iter().position(|&b| b == b'\n');
+        let part = &chunk[..end.unwrap_or(chunk.len())];
+        if fits && line.len() + part.len() <= MAX_MESSAGE {
+            line.extend_from_slice(part);
+        } else {
+            fits = false;
+            line.clear();
+        }
+        let used = end.map_or(chunk.len(), |i| i + 1);
+        input.consume(used);
+        if end.is_some() {
+            return Ok(Some(fits));
+        }
+    }
 }
 
 fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
@@ -68,6 +106,12 @@ fn handle(serial: Option<&str>, line: &str) -> Option<Value> {
     };
     let method = obj.get("method")?;
     let id = obj.get("id")?.clone();
+    if !(id.is_string() || id.is_number()) {
+        return Some(error(Value::Null, -32600, "invalid request: id must be a string or a number"));
+    }
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Some(error(id, -32600, "invalid request: jsonrpc must be \"2.0\""));
+    }
     let Some(method) = method.as_str() else {
         return Some(error(id, -32600, "invalid request"));
     };
@@ -202,6 +246,17 @@ fn call(serial: Option<&str>, params: Option<&Value>) -> Result<Value, RpcError>
         Some(Value::Object(m)) => m,
         Some(_) => return Err((-32602, "invalid params: arguments must be an object".into())),
     };
+    // As each tool's inputSchema says (additionalProperties: false).
+    let known: &[&str] = match name {
+        "get_config" => &["serial"],
+        "list_actions" => &["prefix"],
+        "preview_config" => &["toml", "serial"],
+        "apply_config" => &["toml", "preview_id", "serial"],
+        _ => return Err((-32602, format!("unknown tool: {name}"))),
+    };
+    if let Some(k) = args.keys().find(|k| !known.contains(&k.as_str())) {
+        return Err((-32602, format!("invalid params: {name} has no argument {k:?}")));
+    }
     let serial = arg(args, "serial")?.or(serial);
     let out = match name {
         "get_config" => get_config(serial),
@@ -211,7 +266,7 @@ fn call(serial: Option<&str>, params: Option<&Value>) -> Result<Value, RpcError>
             let toml = required(args, "toml")?;
             apply_config(serial, toml, required(args, "preview_id")?)
         }
-        _ => return Err((-32602, format!("unknown tool: {name}"))),
+        _ => unreachable!("tool names are checked above"),
     };
     let (text, is_error) = match out {
         Ok(text) => (text, false),
@@ -413,6 +468,33 @@ mod tests {
     fn apply_requires_preview_id() {
         let r = call_tool("apply_config", json!({"toml": "format = 2"}));
         assert_eq!(r["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn requests_must_match_the_schema() {
+        // Unknown tool arguments, a wrong jsonrpc version, and ids that aren't strings or numbers.
+        let r = call_tool("preview_config", json!({"toml": "format = 2", "force": true}));
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+        let r = handle(None, &json!({"jsonrpc": "1.0", "id": 3, "method": "ping"}).to_string()).unwrap();
+        assert_eq!((r["error"]["code"].clone(), r["id"].clone()), (json!(-32600), json!(3)));
+        for id in [json!(null), json!({"a": 1}), json!([1])] {
+            let r = handle(None, &json!({"jsonrpc": "2.0", "id": id, "method": "ping"}).to_string()).unwrap();
+            assert_eq!((r["error"]["code"].clone(), r["id"].clone()), (json!(-32600), Value::Null));
+        }
+        let r = handle(None, &json!({"jsonrpc": "2.0", "id": "a", "method": "ping"}).to_string()).unwrap();
+        assert_eq!(r["result"], json!({}));
+    }
+
+    #[test]
+    fn serve_refuses_oversized_lines_and_continues() {
+        let input = format!("{}\n{}\n", "x".repeat(MAX_MESSAGE + 1), req(2, "ping", json!({})));
+        let mut out = Vec::new();
+        serve(None, Cursor::new(input), &mut out).unwrap();
+        let replies: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["error"]["code"], -32600);
+        assert_eq!(replies[1]["id"], 2);
+        assert_eq!(replies[1]["result"], json!({}));
     }
 
     #[test]

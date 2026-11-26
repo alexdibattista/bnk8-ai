@@ -12,6 +12,8 @@
 //! updated so Studio and its agent see the same config. Devices without a
 //! slot are written with `0x11`.
 
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -38,22 +40,62 @@ pub enum Current {
     Unknown { crc: u32 },
 }
 
+/// The state directory: `$XDG_STATE_HOME/bnk8`, else `~/.local/state/bnk8`.
+/// A relative `XDG_STATE_HOME` is ignored, as the XDG spec says; `HOME` must be absolute.
 fn dir() -> Result<PathBuf> {
-    if let Some(d) = std::env::var_os("XDG_STATE_HOME").filter(|d| !d.is_empty()) {
-        return Ok(PathBuf::from(d).join("bnk8"));
+    if let Some(d) = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).filter(|d| d.is_absolute()) {
+        return Ok(d.join("bnk8"));
     }
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local/state/bnk8"))
+    let home = std::env::var_os("HOME").map(PathBuf::from).filter(|h| h.is_absolute());
+    Ok(home.context("HOME is not set to an absolute path")?.join(".local/state/bnk8"))
 }
 
-/// The snapshot's bytes; `None` when there is none yet. Other I/O errors
-/// propagate, so an unreadable snapshot is not mistaken for an unknown config.
-fn read_snapshot(p: &Path) -> Result<Option<Vec<u8>>> {
-    match std::fs::read(p) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading the snapshot {}", p.display())),
+/// Creates the state directory `d`, owner-only, if missing. Refuses one that
+/// isn't a real directory owned by this user, or that others can write to,
+/// since anyone who can write there can choose what bnk8 believes the device holds.
+fn make_dir(d: &Path) -> Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(d).with_context(|| format!("creating {}", d.display()))?;
+    let m = std::fs::symlink_metadata(d).with_context(|| format!("checking {}", d.display()))?;
+    ensure!(m.is_dir(), "{} is not a directory", d.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        ensure!(m.uid() == uid, "{} belongs to another user", d.display());
+        ensure!(m.mode() & 0o022 == 0, "{} is writable by other users", d.display());
     }
+    Ok(())
+}
+
+/// Opens snapshot files without following a symlink at `p` (or blocking on a FIFO).
+fn open_options(o: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(o, libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    o
+}
+
+/// The snapshot; `None` when there is none yet or it isn't a config's size.
+/// Other I/O errors, a symlink or a non-file propagate, so an unreadable
+/// snapshot is not mistaken for an unknown config.
+fn read_snapshot(p: &Path) -> Result<Option<Blob>> {
+    let mut f = match open_options(OpenOptions::new().read(true)).open(p) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("opening the snapshot {}", p.display())),
+    };
+    let m = f.metadata().with_context(|| format!("checking the snapshot {}", p.display()))?;
+    ensure!(m.is_file(), "the snapshot {} is not a regular file", p.display());
+    if m.len() != CONFIG_LEN as u64 {
+        return Ok(None);
+    }
+    let mut blob = [0; CONFIG_LEN];
+    f.read_exact(&mut blob).with_context(|| format!("reading the snapshot {}", p.display()))?;
+    Ok(Some(blob))
 }
 
 /// The snapshot file of the device with USB serial `serial`, which must be a
@@ -113,10 +155,15 @@ pub fn current(dev: &Bnk8) -> Result<Current> {
             return Ok(Current::Known(Box::new(native), Source::ProfileStore { names }));
         }
     }
+    without_slot(dev, crc)
+}
+
+/// The config with CRC `crc` on a device whose profile store doesn't hold it:
+/// bnk8's snapshot, or a factory config.
+fn without_slot(dev: &Bnk8, crc: u32) -> Result<Current> {
     // Without a state directory there is no snapshot, but the factory check still applies.
     if let Ok(p) = path(dev.serial())
-        && let Some(bytes) = read_snapshot(&p)?
-        && let Ok(blob) = Blob::try_from(bytes.as_slice())
+        && let Some(blob) = read_snapshot(&p)?
         && crc32(&blob) == crc
     {
         return Ok(Current::Known(Box::new(blob), Source::Snapshot));
@@ -191,7 +238,7 @@ pub fn prepare(dev: &Bnk8, cfg: &Config) -> Result<Prepared> {
             cfg.macros.values_mut().for_each(|m| m.name = None);
         }
         let ids = StudioIds::new();
-        let (native, changes) = match current(dev)? {
+        let (native, changes) = match without_slot(dev, device_crc)? {
             Current::Known(cur, _) => {
                 let native = config::to_blob(&cfg, &cur, &ids)?;
                 let changes = config::changes(Some(&cur), &native)?;
@@ -248,10 +295,22 @@ pub fn prepare(dev: &Bnk8, cfg: &Config) -> Result<Prepared> {
     })
 }
 
+/// Replaces the snapshot `p` with `blob` through a new owner-only temporary
+/// file, so a crash or a file planted under the temporary name can't leave a
+/// partial snapshot or redirect the write.
 fn save(p: &Path, blob: &Blob) -> Result<()> {
-    let tmp = p.with_extension("tmp");
-    std::fs::write(&tmp, blob).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, p).with_context(|| format!("replacing {}", p.display()))
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let tmp = p.with_extension(format!("{}.{nanos}.tmp", std::process::id()));
+    let mut o = OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let mut f = open_options(&mut o).open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    let written = f.write_all(blob).and_then(|()| f.sync_all()).and_then(|()| std::fs::rename(&tmp, p));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("replacing {}", p.display()))
 }
 
 /// Writes a prepared config, and records it as the snapshot. Fails without
@@ -259,18 +318,58 @@ fn save(p: &Path, blob: &Blob) -> Result<()> {
 /// directory is prepared first, so an unusable one fails before the device is touched.
 pub fn commit(dev: &Bnk8, p: &Prepared) -> Result<()> {
     let snapshot = path(dev.serial())?;
-    let d = snapshot.parent().unwrap();
-    std::fs::create_dir_all(d).with_context(|| format!("creating {}", d.display()))?;
+    make_dir(snapshot.parent().unwrap())?;
     ensure!(
         dev.status()?.token_b == p.device_crc,
         "the device's config changed since the changes were worked out; read it again"
     );
     match &p.store {
-        None => dev.write_config(&p.native)?,
+        None => dev.write_config(&p.native, p.device_crc)?,
         Some((revision, archive)) => dev.store_save(*revision, &[&p.native[..], archive].concat(), &mut |_| {})?,
     }
     save(&snapshot, &p.native).context(
         "the device was updated, but its local snapshot was not saved: \
          bnk8 will report the config as unknown until the next apply or reset",
     )
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn snapshots_are_private_regular_files() {
+        let d = std::env::temp_dir().join(format!("bnk8-store-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let state = d.join("state/bnk8");
+        make_dir(&state).unwrap();
+        assert_eq!(std::fs::metadata(&state).unwrap().permissions().mode() & 0o777, 0o700);
+
+        // A written snapshot is owner-only and reads back; no temporary file is left.
+        let p = state.join("SERIAL.bin");
+        save(&p, FACTORY).unwrap();
+        save(&p, FACTORY).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(read_snapshot(&p).unwrap(), Some(*FACTORY));
+        assert_eq!(std::fs::read_dir(&state).unwrap().count(), 1);
+
+        // A file of the wrong size is no snapshot; a symlink or a directory is an error.
+        std::fs::write(&p, [0; 3]).unwrap();
+        assert_eq!(read_snapshot(&p).unwrap(), None);
+        std::fs::remove_file(&p).unwrap();
+        let elsewhere = d.join("elsewhere.bin");
+        std::fs::write(&elsewhere, FACTORY).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &p).unwrap();
+        assert!(read_snapshot(&p).is_err());
+        std::fs::remove_file(&p).unwrap();
+        std::fs::create_dir(&p).unwrap();
+        assert!(read_snapshot(&p).is_err());
+
+        // A state directory others can write to is refused.
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(format!("{:#}", make_dir(&state).unwrap_err()).contains("writable by other users"));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }

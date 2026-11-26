@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::mpsc::{Sender, channel};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use iced::futures::channel::oneshot;
 use iced::widget::{
     Column, button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, rule, scrollable, slider,
@@ -19,7 +19,7 @@ use bnk8::config::{
 };
 use bnk8::presets::{self, Preset};
 use bnk8::store::{self, Current, Source};
-use bnk8::{actions, transport};
+use bnk8::{actions, protocol, transport};
 
 use crate::assistant::{self, Answer, Login};
 use crate::style::{self, BOLD, SEMIBOLD, Tone};
@@ -65,6 +65,9 @@ struct Connected {
     /// The device's config, when bnk8 can prove it (CRC match with the
     /// snapshot, the factory config or the profile store's copy).
     config: Option<Box<Blob>>,
+    /// The CRC of the device's config when it was loaded or last written: the
+    /// base the shown changes were worked out against.
+    crc: u32,
     source: String,
     /// The device has a profile store slot, so writes keep layer and macro names.
     store: bool,
@@ -273,7 +276,8 @@ pub struct App {
     worker: Sender<Job>,
     message: Option<(Tone, String)>,
     show_changes: bool,
-    confirm_reset: bool,
+    /// The device a factory reset was asked for, while the dialog is open.
+    confirm_reset: Option<String>,
     catalog: Catalog,
     /// Layer templates, as pick-list options.
     templates: Vec<&'static Preset>,
@@ -306,7 +310,7 @@ impl App {
             worker,
             message: None,
             show_changes: false,
-            confirm_reset: false,
+            confirm_reset: None,
             catalog: Catalog::new(),
             templates: presets::PRESETS.iter().collect(),
             ai: Ai { login: Login::Unchecked, prompt: String::new(), asking: false, answer: None },
@@ -379,12 +383,19 @@ impl App {
         })
     }
 
-    /// Writes `cfg`, through the device's profile store when it has one.
-    fn write(&mut self, cfg: Config) -> Task<Message> {
-        let Some(serial) = self.target().map(|c| c.serial.clone()) else { return Task::none() };
+    /// Writes `cfg`, through the device's profile store when it has one. With
+    /// `same_base`, refuses when the device's config is no longer the one the
+    /// shown changes were worked out against.
+    fn write(&mut self, cfg: Config, same_base: bool) -> Task<Message> {
+        let Some((serial, crc)) = self.target().map(|c| (c.serial.clone(), c.crc)) else { return Task::none() };
         self.spawn("Writing to device", move || {
             let dev = transport::open(Some(&serial))?;
             let p = store::prepare(&dev, &cfg)?;
+            ensure!(
+                !same_base || p.device_crc == crc,
+                "The keypad's config changed since it was loaded, so the changes shown are out of date. \
+                 Press Load from device, check the changes, then apply again."
+            );
             let changes = match &p.changes {
                 Changes::Items(lines) => lines.len(),
                 Changes::Unknown => config::flatten(&cfg).len(),
@@ -417,10 +428,11 @@ impl App {
                 }
             }
             Ok(Done::Loaded { serial, read }) => {
-                let (blob, cfg, source, store) = match read {
+                let (blob, cfg, source, store, crc) = match read {
                     Read::Known { blob, cfg, source, store } => {
                         self.info(format!("Loaded {serial} ({source})"));
-                        (Some(blob), cfg, source, store)
+                        let crc = protocol::crc32(&*blob);
+                        (Some(blob), cfg, source, store, crc)
                     }
                     Read::Unknown { crc } => {
                         self.error(format!(
@@ -429,13 +441,13 @@ impl App {
                              factory defaults; Apply writes the whole config."
                         ));
                         let cfg = config::from_blob(FACTORY).expect("factory config decodes");
-                        (None, cfg, "unknown".into(), false)
+                        (None, cfg, "unknown".into(), false, crc)
                     }
                 };
                 let names = Names::of(&cfg);
                 self.cfg = cfg;
                 self.clamp_layer();
-                self.connected = Some(Connected { serial, config: blob, source, store, names });
+                self.connected = Some(Connected { serial, config: blob, crc, source, store, names });
             }
             Ok(Done::Written { blob, changes, edits, store }) => {
                 let Some(blob) = blob else {
@@ -461,6 +473,7 @@ impl App {
                     self.clamp_layer();
                 }
                 if let Some(c) = &mut self.connected {
+                    c.crc = protocol::crc32(&*blob);
                     c.config = Some(blob);
                     c.source = if store { "the device's profile store" } else { "last written by bnk8" }.into();
                     c.store = store;
@@ -708,7 +721,7 @@ impl App {
             Message::ToggleChanges => self.show_changes = !self.show_changes,
             Message::Apply if idle && self.target().is_some() => {
                 if self.pending().is_some_and(|n| n > 0) {
-                    return self.write(self.cfg.clone());
+                    return self.write(self.cfg.clone(), true);
                 }
             }
             Message::Discard if idle => {
@@ -733,14 +746,15 @@ impl App {
                 );
             }
             Message::Exported(Some(path)) => self.export(path),
-            Message::AskReset if idle && self.target().is_some() => self.confirm_reset = true,
+            Message::AskReset if idle => self.confirm_reset = self.target().map(|c| c.serial.clone()),
             Message::ConfirmReset => {
-                self.confirm_reset = false;
-                if idle && self.target().is_some() {
-                    return self.write(config::from_blob(FACTORY).expect("factory config decodes"));
+                // Only for the device the dialog was opened for, and only while it is still the target.
+                let asked = self.confirm_reset.take();
+                if idle && asked.is_some() && asked.as_deref() == self.target().map(|c| c.serial.as_str()) {
+                    return self.write(config::from_blob(FACTORY).expect("factory config decodes"), false);
                 }
             }
-            Message::CancelReset => self.confirm_reset = false,
+            Message::CancelReset => self.confirm_reset = None,
             // Stale clicks on controls that are disabled now, and cancelled dialogs.
             Message::RefreshDevices
             | Message::Load
@@ -883,7 +897,7 @@ impl App {
         .push(body.height(Fill))
         .push(rule::horizontal(1).style(rule::weak))
         .push(container(self.footer()).width(Fill).style(style::chrome));
-        if self.confirm_reset { stack![page, self.reset_dialog()].into() } else { page.into() }
+        if self.confirm_reset.is_some() { stack![page, self.reset_dialog()].into() } else { page.into() }
     }
 
     fn header(&self) -> Element<'_, Message> {

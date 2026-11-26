@@ -397,6 +397,7 @@ dependencies = [
  "clap",
  "crc",
  "hidapi",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

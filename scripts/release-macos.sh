@@ -37,8 +37,13 @@ cd "$root"
 
 die() { echo "error: $*" >&2; exit 1; }
 step() { echo "==> $*"; }
+# Escapes a value for an XML text node.
+xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
 # ---- preflight: everything that can fail before a long build ---------------
+
+# macOS bundle versions are up to three dot-separated integers.
+[[ $version =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || die "version $version is not MAJOR.MINOR.PATCH"
 
 for manifest in Cargo.toml gui/Cargo.toml; do
     v=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$manifest" | head -1)
@@ -139,17 +144,17 @@ cat >"$app/Contents/Info.plist" <<EOF
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key><string>en</string>
-    <key>CFBundleDisplayName</key><string>$app_name</string>
+    <key>CFBundleDisplayName</key><string>$(xml "$app_name")</string>
     <key>CFBundleExecutable</key><string>bnk8-gui</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
-    <key>CFBundleIdentifier</key><string>$bundle_id</string>
+    <key>CFBundleIdentifier</key><string>$(xml "$bundle_id")</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    <key>CFBundleName</key><string>$app_name</string>
+    <key>CFBundleName</key><string>$(xml "$app_name")</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>$version</string>
-    <key>CFBundleVersion</key><string>$version</string>
+    <key>CFBundleShortVersionString</key><string>$(xml "$version")</string>
+    <key>CFBundleVersion</key><string>$(xml "$version")</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
-    <key>LSMinimumSystemVersion</key><string>$min_macos</string>
+    <key>LSMinimumSystemVersion</key><string>$(xml "$min_macos")</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>© Alexander Di Battista. MIT OR Apache-2.0.</string>
 </dict>

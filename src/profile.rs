@@ -118,7 +118,7 @@ fn str_field<'a>(v: &'a Value, k: &str) -> Result<&'a str> {
 }
 
 fn index_of(v: &Value) -> Result<usize> {
-    v["index"].as_u64().map(|n| n as usize).with_context(|| format!("layer without index: {v}"))
+    v["index"].as_u64().and_then(|n| usize::try_from(n).ok()).with_context(|| format!("layer without index: {v}"))
 }
 
 /// The bnk8 name Studio's action reference `r` compiles to, if bnk8 can
@@ -171,7 +171,7 @@ pub fn from_profile(p: &Value, native: &Blob) -> Result<(Config, Aliases)> {
     let desktop_macros: Vec<String> = macros
         .iter()
         .filter(|m| m["storage"] == "Desktop")
-        .filter_map(|m| Some(format!("macro.{}", m["slot"].as_u64()? + 1)))
+        .filter_map(|m| Some(format!("macro.{}", m["slot"].as_u64()?.checked_add(1)?)))
         .collect();
 
     // Shared lighting: every layer gets layer 0's lighting (Compile).
@@ -231,7 +231,7 @@ pub fn from_profile(p: &Value, native: &Blob) -> Result<(Config, Aliases)> {
 
     let mut cfg_macros = BTreeMap::new();
     for m in macros.iter().filter(|m| m["storage"] == "OnDevice") {
-        let slot = m["slot"].as_u64().map(|s| s as usize).filter(|s| *s < MACRO_SLOTS);
+        let slot = m["slot"].as_u64().and_then(|s| usize::try_from(s).ok()).filter(|s| *s < MACRO_SLOTS);
         let slot = slot.with_context(|| format!("macro slot out of range: {m}"))?;
         let steps = m["steps"].as_array().context("macro without steps")?;
         ensure!(steps.len() <= config::MACRO_STEPS, "macro {} has {} steps", slot + 1, steps.len());
@@ -476,6 +476,11 @@ fn macro_steps(steps: &[String]) -> Result<Vec<Value>> {
 /// settings) is kept. Layers and macros without a name keep the previous name
 /// at their position.
 pub fn to_profile(cfg: &Config, prev: &Value, aliases: &Aliases, now: &str) -> Result<Value> {
+    let n_layers = cfg.layers.len();
+    ensure!((1..=MAX_LAYERS).contains(&n_layers), "layers: {n_layers} layers, expected 1..={MAX_LAYERS}");
+    for (p, l) in cfg.layers.iter().enumerate() {
+        ensure!(l.keys.len() == KEYS, "layers[{p}].keys: {} keys, expected {KEYS}", l.keys.len());
+    }
     check_representable(cfg, aliases)?;
     let mut out = prev.as_object().context("the previous profile is not a JSON object")?.clone();
     let prev_layers = prev["layers"].as_array().cloned().unwrap_or_default();
@@ -507,8 +512,7 @@ pub fn to_profile(cfg: &Config, prev: &Value, aliases: &Aliases, now: &str) -> R
     };
     let mut macros = Vec::new();
     for (key, m) in &cfg.macros {
-        let slot: usize = key.parse().with_context(|| format!("macros.{key}"))?;
-        let slot = slot - 1;
+        let slot = config::macro_slot(key).with_context(|| format!("macros.{key}: slot must be 1..={MACRO_SLOTS}"))?;
         let name = m.name.clone().or_else(|| prev_name(slot)).unwrap_or_else(|| config::default_macro_name(slot));
         macros.push(json!({
             "slot": slot,
@@ -525,11 +529,14 @@ pub fn to_profile(cfg: &Config, prev: &Value, aliases: &Aliases, now: &str) -> R
     Ok(Value::Object(out))
 }
 
-/// The current UTC time as RFC 3339 (`2026-11-24T12:34:56Z`), for `updatedAt`.
+/// The current UTC time as RFC 3339 (`2026-11-24T12:34:56Z`), for `updatedAt`;
+/// a clock past the year 9999 reads as its last second.
 pub fn now_utc() -> String {
+    const LAST_SECOND_OF_9999: u64 = 253_402_300_799;
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+        .map_or(0, |d| d.as_secs())
+        .min(LAST_SECOND_OF_9999);
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = days as i64 + 719_468;
@@ -570,6 +577,21 @@ mod tests {
 
     fn blob(cfg: &Config, aliases: &Aliases) -> Blob {
         config::to_blob(cfg, FACTORY, &aliases.ids()).unwrap()
+    }
+
+    #[test]
+    fn to_profile_refuses_configs_it_cannot_lay_out() {
+        let refused = |edit: &dyn Fn(&mut Config)| {
+            let mut cfg = factory();
+            edit(&mut cfg);
+            format!("{:#}", to_profile(&cfg, &prev(), &Aliases::default(), "t").unwrap_err())
+        };
+        assert!(refused(&|c| c.layers.clear()).contains("0 layers"));
+        assert!(refused(&|c| c.layers[1].keys.pop().map(drop).unwrap()).contains("layers[1].keys"));
+        for slot in ["0", "16", "03", "18446744073709551616"] {
+            let e = refused(&|c| drop(c.macros.insert(slot.into(), vec!["tap keyboard.a".to_string()].into())));
+            assert!(e.contains(&format!("macros.{slot}")), "{e}");
+        }
     }
 
     #[test]

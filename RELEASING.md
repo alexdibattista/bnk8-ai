@@ -59,7 +59,7 @@ gh secret set APPLE_API_ISSUER --env release --body <ISSUER-ID>
 
 Don't also set them as repository secrets: those reach every workflow on every branch. Then delete the exported `.p12`, and keep the `.p8` somewhere safe, such as a password manager.
 
-**Current setup (2026-11-24):** identity `Developer ID Application: V&A Labs inc (D763F5MGGM)` (certificate `PP2PV557YA`, expires 2027-12-24), notarization key `9887GJC4JS` ("bnk8 notary", Developer role), local notarytool profile `bnk8-notary`, and the five secrets in the `release` environment, with @alexdibattista as required reviewer. When the certificate expires, create a new one from a new CSR and replace `MACOS_CERTIFICATE_P12` and `MACOS_CERTIFICATE_PASSWORD`.
+**Current setup (2026-11-24):** identity `Developer ID Application: V&A Labs inc (D763F5MGGM)` (expires 2027-12-24), a dedicated App Store Connect notarization key with the Developer role, local notarytool profile `bnk8-notary`, and the five secrets in the `release` environment, with @alexdibattista as required reviewer. When the certificate expires, create a new one from a new CSR and replace `MACOS_CERTIFICATE_P12` and `MACOS_CERTIFICATE_PASSWORD`.
 
 **Dry run:** to check signing and notarization without releasing, run the workflow by hand: **Actions → Release (macOS) → Run workflow** on `main`, or `gh workflow run release-macos.yml --ref main`, then approve the `release` environment. It builds, signs and notarizes the version in `Cargo.toml` and keeps the files as the run's `macos-release` artifact for 7 days; it creates no tag or release.
 

@@ -305,8 +305,9 @@ pub fn legacy_name(old: &str) -> Option<String> {
         if let Some(rest) = old.strip_prefix(prefix)
             && let Ok(n) = rest.parse::<u64>()
             && n.to_string() == rest
+            && let Some(next) = n.checked_add(1)
         {
-            return Some(format!("{prefix}{}", n + 1));
+            return Some(format!("{prefix}{next}"));
         }
     }
     None

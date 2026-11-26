@@ -138,6 +138,11 @@ pub fn macro_key(slot: usize) -> String {
     (slot + 1).to_string()
 }
 
+/// The 0-based macro slot of `[macros]` key `key`: `"1"`..`"15"`, no leading zeros.
+pub fn macro_slot(key: &str) -> Option<usize> {
+    key.parse().ok().filter(|m: &usize| (1..=MACRO_SLOTS).contains(m) && m.to_string() == key).map(|m| m - 1)
+}
+
 /// The name bnk8 gives a macro without one in Binepad Studio's profile; read
 /// back as no name.
 pub fn default_macro_name(slot: usize) -> String {
@@ -743,12 +748,7 @@ pub fn to_blob(cfg: &Config, base: &Blob, ids: &StudioIds) -> Result<Blob> {
 
     b[OFF_MACROS..OFF_MACROS + MACRO_SLOTS * MACRO_LEN].fill(0);
     for (slot, Macro { name, steps }) in &cfg.macros {
-        let m = slot
-            .parse()
-            .ok()
-            .filter(|m: &usize| (1..=MACRO_SLOTS).contains(m) && m.to_string() == *slot)
-            .with_context(|| format!("macros.{slot}: slot must be 1..={MACRO_SLOTS}"))?
-            - 1;
+        let m = macro_slot(slot).with_context(|| format!("macros.{slot}: slot must be 1..={MACRO_SLOTS}"))?;
         if let Some(name) = name {
             ensure!(
                 plain_name(name),
@@ -931,10 +931,8 @@ fn migrate_v1(cfg: &mut Config) {
                 *step = format!("{verb} {new}");
             }
         }
-        let slot = match slot.parse::<u64>() {
-            Ok(n) if n.to_string() == slot => (n + 1).to_string(),
-            _ => slot,
-        };
+        let next = slot.parse::<u64>().ok().filter(|n| n.to_string() == slot).and_then(|n| n.checked_add(1));
+        let slot = next.map_or(slot, |n| n.to_string());
         cfg.macros.insert(slot, m);
     }
 }

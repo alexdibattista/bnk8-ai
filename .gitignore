@@ -2,3 +2,10 @@
 /dist
 # Binepad Studio binaries and decompiled source: third-party, never publish.
 /work
+# Local signing and notarization material (RELEASING.md): never commit.
+*.p12
+*.p8
+*.pem
+*.cer
+*.certSigningRequest
+.env*

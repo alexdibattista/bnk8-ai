@@ -173,7 +173,7 @@ pub fn add(cfg: &mut Config, preset: &Preset, lighting: &Lighting) -> Result<usi
         cw: Some("media.volume_up".into()),
         ..Slots::default()
     };
-    let free_slots = MACRO_SLOTS - cfg.macros.len();
+    let free_slots = (0..MACRO_SLOTS).filter(|s| !cfg.macros.contains_key(&config::macro_key(*s))).count();
     if needed > free_slots {
         bail!(
             "{} needs {needed} free macro slots and {free_slots} are free; clear unused macros on the Macros tab first",
